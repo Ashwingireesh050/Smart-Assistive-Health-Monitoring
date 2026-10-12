@@ -1,0 +1,3331 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+#include <Wire.h>
+#include <DHT.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Preferences.h>
+#include <LittleFS.h>
+#include <time.h>
+#include <esp_task_wdt.h>
+#include <esp_system.h>
+#include <math.h>
+#include <algorithm>
+#include <string.h>
+#if __has_include(<esp_arduino_version.h>)
+#include <esp_arduino_version.h>
+#endif
+
+#ifndef WEBSOCKETS_SERVER_CLIENT_MAX
+#define WEBSOCKETS_SERVER_CLIENT_MAX 5
+#endif
+
+#if configTICK_RATE_HZ != 1000
+#error "This sketch expects a 1 kHz FreeRTOS tick (ESP32 Arduino default)."
+#endif
+
+// =====================================================================
+//  CONFIG — change before deploying
+// =====================================================================
+const char* ssid     = "Nothing phone-2";
+const char* password = "Red369-@#$";
+
+#define DASH_USER          "admin"
+#define DASH_PASS          "medmonitor"   // CHANGE THIS — dashboard login
+#define DASH_PASS_DEFAULT  "medmonitor"
+
+// AD8232 module gain (instrumentation amp x output stage). SparkFun-style
+// boards: 100 x 11 = 1100. Check your module's datasheet/schematic.
+#define AD8232_GAIN        1100.0f
+
+// true  = trust the AD8232 LO+/LO- pins (fail-safe: a flat line with leads
+//         reported ON raises ASYSTOLE).
+// false = clone board with broken LO pins: a flat line is treated as
+//         "leads off" (asystole can then NOT be distinguished — avoid).
+#define LO_PINS_TRUSTED    true
+
+// Dry/reused electrodes make the AD8232 LO pins flicker HIGH while the ECG is
+// perfectly readable. true = if a regular ECG rhythm is being detected, a HIGH
+// LO pin is ignored (and reported as "LO ignored"). Leads truly coming off
+// stop the rhythm, so leads-off is still reported within ~3.3 s.
+#define LO_SIGNAL_OVERRIDE true
+
+// true = stream raw + filtered ECG to the Arduino Serial Plotter (250 lines/s)
+// for bench debugging. Leave false in normal use.
+#define ECG_SERIAL_PLOT    false
+
+// Heart Rate card source. true = pulse oximeter (MAX30100/MAX30102), stabilised.
+// The ECG rate is still computed and shown next to the ECG trace.
+#define HR_FROM_PULSE_OX   true
+// No finger on the sensor: true = show the ECG rate on the card instead,
+// false = show "--" (card is strictly the pulse-oximeter rate).
+#define HR_FALLBACK_TO_ECG false
+
+// DS18B20 on skin/armpit reads below core temperature. Measure against a
+// clinical thermometer and put the difference here (e.g. 1.2).
+#define BODY_TEMP_OFFSET_C 0.0f
+
+// Optional local alarm LED. -1 = disabled (pinout unchanged). On most
+// DevKit boards the on-board LED is GPIO 2 if you want to use it.
+constexpr int ALARM_LED_PIN = -1;
+
+// =====================================================================
+//  PINS (unchanged)
+// =====================================================================
+#define LO_PLUS_PIN    32   // AD8232 LO+
+#define LO_MINUS_PIN   33   // AD8232 LO-
+#define ECG_OUTPUT_PIN 36   // AD8232 OUT (ADC1 — works while WiFi is on)
+#define DHT_PIN        4
+#define DHT_TYPE       DHT11
+#define ONE_WIRE_BUS   5    // DS18B20 (needs 4.7k pull-up to 3.3V)
+#define I2C_SDA_PIN    21   // pulse sensor SDA (MAX30100 or MAX30102)
+#define I2C_SCL_PIN    22   // pulse sensor SCL
+
+// =====================================================================
+//  PULSE OXIMETER (own driver — MAX30100 or MAX30102 auto-detected)
+// =====================================================================
+#define POX_UPDATE_DIV 3          // read the sensor FIFO every 3 x 4 ms = 12 ms
+const uint32_t I2C_CLOCK_HZ   = 100000;
+const uint16_t I2C_TIMEOUT_MS = 10;
+
+// SpO2 = SPO2_CAL_A - SPO2_CAL_B * R. Generic constants: NOT calibrated for
+// your sensor. To calibrate, compare with a certified oximeter at 2+ levels.
+#define SPO2_CAL_A         110.0f
+#define SPO2_CAL_B         25.0f
+// Finger detection on IR DC level (fraction of full scale). Serial [PPG]
+// lines print "IR DC %": if "no finger" shows > 8 %, raise both values.
+#define PO_FINGER_ON       0.15f
+#define PO_FINGER_OFF      0.08f
+
+// Display smoothing (applied to the module's per-second estimate):
+// 1 Hz exponential smoothing + 0.8 bpm hysteresis, value held up to 5 s
+// through motion or LED re-tuning.
+#define PULSE_EMA_ALPHA    0.30f
+#define PULSE_HYST_BPM     0.8f
+#define PULSE_HOLD_MS      8000     // covers a motion burst + 5 s clean refill
+#define SPO2_MEDIAN_N      5
+#define SPO2_EMA_ALPHA     0.30f
+#define SPO2_HYST_PCT      0.8f
+#define SPO2_MIN_VALID     70
+
+// =====================================================================
+//  DATA LOGGING (CSV on flash)
+// =====================================================================
+#define LOG_PATH        "/vitals_log.csv"
+#define LOG_MAX_BYTES   (512UL * 1024UL)   // ~9,500 rows: 2.6 h at 1 s, 13 h at 5 s, 6.6 days at 1 min
+#define LOG_FLUSH_ROWS  10                 // write to flash every 10 rows (intervals < 10 s)
+#define LOG_RECENT_N    10                 // rows shown in the dashboard table
+static const uint16_t LOG_INTERVALS[] = {1, 2, 5, 10, 30, 60};   // seconds
+
+// =====================================================================
+//  ECG SIGNAL CHAIN
+// =====================================================================
+#define MAINS_HZ        50.0f   // India = 50 Hz (60 for the Americas)
+#define ECG_FS          250
+#define ECG_OVERSAMPLE  4
+#define ECG_BATCH       10      // samples per WebSocket frame (25 frames/s)
+#define ECG_QUEUE_LEN   500     // 2 s buffer between sensor task and loop()
+#define ECG_HP_HZ       0.5f
+#define ECG_LP_HZ       40.0f
+#define ECG_NOTCH_Q     5.0f
+// v3.1: raw analogRead() + fixed scale. analogReadMilliVolts() depends on
+// eFuse calibration and returns 0 / wrong values on some boards and core
+// versions, which made v3 think the amplifier output was stuck at a rail.
+const float    ADC_MV_PER_COUNT  = 3300.0f / 4095.0f;     // ~±10 % (amplitude scale only)
+const float    UV_PER_COUNT      = ADC_MV_PER_COUNT * 1000.0f / AD8232_GAIN;
+const uint16_t ADC_PINNED_LOW    = 16;     // within 16 counts of 0 or 4095 =
+const uint16_t ADC_PINNED_HIGH   = 4079;   // amplifier output at the rail
+const uint8_t  SATURATED_PCT     = 95;     // pinned >= 95 % of 1 s = lead fault
+const uint8_t  CLIPPING_PCT      = 5;      // pinned >= 5 % = clipping warning only
+const uint16_t FLAT_RANGE_COUNTS = 40;     // only used if LO_PINS_TRUSTED == false
+
+// Lead-off reason bits (sent to the dashboard)
+#define LEAD_LO_PLUS    0x01   // LO+ high  (+IN, LA electrode on SparkFun-style boards)
+#define LEAD_LO_MINUS   0x02   // LO- high  (-IN, RA electrode)
+#define LEAD_SATURATED  0x04   // output pinned at a rail for a full second
+#define LEAD_CLIPPING   0x08   // some samples at the rail (information only)
+#define LEAD_LO_IGNORED 0x10   // LO pin says off but a regular ECG is present
+
+// QRS detector
+#define QRS_MWI_LEN        38       // 150 ms moving-window integrator
+#define QRS_REFRACTORY_MS  200
+#define QRS_TWAVE_MS       360      // candidate this soon after a QRS may be a T wave
+#define QRS_LEARN_MS       2000
+#define QRS_RELEARN_MS     3000     // no QRS for 3 s -> re-learn thresholds
+#define QRS_MIN_PP_UV      80.0f    // absolute floor: smaller "beats" are noise
+#define QRS_ARTEFACT_X     6.0f     // peak > 6 x learned QRS energy = artefact, ignored
+#define QRS_RR_N           8
+#define QRS_RR_MIN_MS      250      // 240 bpm
+#define QRS_RR_MAX_MS      2400     // 25 bpm
+#define QRS_HR_TIMEOUT_MS  4000
+#define QRS_MIN_RR_FOR_HR  4        // need 5 beats before showing a rate
+#define QRS_RR_TOLERANCE   0.25f    // RR within ±25 % of median counts as consistent
+#define QRS_CONSISTENT_PCT 60       // >= 60 % consistent RR, else ECG HR = unreliable
+
+// =====================================================================
+//  TIMING
+// =====================================================================
+const TickType_t    SENSOR_PERIOD      = pdMS_TO_TICKS(1000 / ECG_FS);  // 4 ms
+const unsigned long VITALS_INTERVAL    = 1000;
+const unsigned long ALARM_EVAL_MS      = 250;
+const unsigned long ALARM_RESEND_MS    = 5000;
+const unsigned long DHT_INTERVAL       = 2000;
+const unsigned long TEMP_INTERVAL      = 2000;
+const unsigned long SENSOR_STALE_MS    = 10000;  // no valid reading -> "--"
+const unsigned long SIG_WINDOW_MS      = 1000;   // signal-quality window
+const unsigned long LO_DEBOUNCE_MS     = 300;    // LO pin must be stable this long
+const unsigned long LO_OVERRIDE_MS     = 3000;   // regular QRS within 3 s overrides a flaky LO pin
+const unsigned long BEAT_STALE_MS      = 8000;
+const unsigned long STATS_INTERVAL_MS  = 60000;
+const unsigned long WS_AUTH_TIMEOUT_MS = 3000;
+const unsigned long WS_SLOW_CLIENT_MS  = 250;
+const uint32_t      WDT_TIMEOUT_S      = 8;
+
+// =====================================================================
+//  ALARMS
+// =====================================================================
+enum : uint8_t { PRIO_LOW = 1, PRIO_HIGH = 2, PRIO_CRIT = 3 };
+enum AlarmId : uint8_t {
+  AL_ASYSTOLE = 0, AL_HR_LOW, AL_HR_HIGH, AL_SPO2_LOW, AL_TEMP_HIGH, AL_TEMP_LOW,
+  AL_LEADS_OFF, AL_SPO2_NOSIG, AL_SPO2_LOST, AL_TEMP_LOST, AL_COUNT
+};
+struct AlarmDef { const char* name; uint8_t prio; uint32_t delayMs; };
+// Keep this order in sync with ALARM_TEXT[] in the dashboard script.
+static const AlarmDef ALARM_DEFS[AL_COUNT] = {
+  {"ASYSTOLE",          PRIO_CRIT, 0},      // condition itself = 4 s without QRS
+  {"HR_CRIT_LOW",       PRIO_CRIT, 5000},
+  {"HR_CRIT_HIGH",      PRIO_CRIT, 5000},
+  {"SPO2_CRIT_LOW",     PRIO_CRIT, 10000},
+  {"TEMP_HIGH",         PRIO_HIGH, 30000},
+  {"TEMP_LOW",          PRIO_HIGH, 30000},
+  {"ECG_LEADS_OFF",     PRIO_HIGH, 3000},
+  {"SPO2_NO_SIGNAL",    PRIO_LOW,  2000},
+  {"SPO2_SENSOR_LOST",  PRIO_HIGH, 3000},
+  {"TEMP_PROBE_LOST",   PRIO_LOW,  0},
+};
+const int      HR_CRIT_LOW      = 40;
+const int      HR_CRIT_HIGH     = 150;
+const int      SPO2_CRIT_LOW    = 88;
+const float    TEMP_ALARM_HIGH  = 39.5f;
+const float    TEMP_ALARM_LOW   = 31.0f;
+const uint32_t ASYSTOLE_NO_QRS_MS   = 4000;
+const uint32_t ASYSTOLE_LEADS_ON_MS = 6000;   // QRS detector learning grace
+const uint32_t ALARM_CLEAR_MS       = 2000;   // condition gone this long -> clear
+const uint32_t ALARM_SILENCE_MS     = 120000; // ACK silences one alarm 2 min
+
+// =====================================================================
+//  OBJECTS
+// =====================================================================
+WebServer        server(80);
+WebSocketsServer webSocket(81);
+DHT              dht(DHT_PIN, DHT_TYPE);
+OneWire          oneWire(ONE_WIRE_BUS);
+DallasTemperature ds18b20(&oneWire);
+Preferences      prefs;        // patient record
+Preferences      prefsLog;     // data-log metadata
+TaskHandle_t     g_sensorTask = nullptr;
+
+// =====================================================================
+//  SHARED STATE (sensor task writes, loop reads; all <= 32 bit -> atomic)
+// =====================================================================
+QueueHandle_t      ecgQueue        = nullptr;
+volatile bool      s_leadOff       = true;
+volatile bool      s_poxReady      = false;
+volatile uint32_t  s_beatCount     = 0;   // pulse beats (heart-icon blink)
+volatile uint32_t  s_lastBeatMs    = 0;
+volatile uint32_t  s_qrsCount      = 0;   // ECG QRS complexes
+volatile uint32_t  s_lastQrsMs     = 0;
+volatile uint32_t  s_leadOnSinceMs = 0;
+volatile float     s_ecgHr         = 0;
+volatile uint32_t  s_ecgDrops      = 0;
+volatile uint8_t   s_leadReason    = LEAD_LO_PLUS | LEAD_LO_MINUS;
+volatile uint16_t  s_dbgRawMin     = 0, s_dbgRawMax = 0, s_dbgRawAvg = 0;  // last 1 s
+volatile uint8_t   s_dbgPinnedPct  = 0;
+
+// =====================================================================
+//  LOOP-ONLY STATE
+// =====================================================================
+float    g_temperature = 0, g_roomTemp = 0, g_humidity = 0;
+uint32_t g_tempLastOkMs = 0, g_dhtLastOkMs = 0;
+int      g_hr = 0, g_pulse = 0, g_ecgHr = 0, g_spo2 = 0;
+bool     g_ecgArmed = false, g_spo2Armed = false, g_tempArmed = false;
+bool     g_standby = false;
+bool     g_forceAlarmSend = true;
+uint32_t g_queueMax = 0, g_slowClientDrops = 0;
+char     g_wsToken[17];
+
+struct AlarmState { bool cond, active, clearing; uint32_t condSince, clearSince, silencedUntil; };
+AlarmState g_al[AL_COUNT];
+
+bool     g_wsAuthed[WEBSOCKETS_SERVER_CLIENT_MAX];
+bool     g_wsPending[WEBSOCKETS_SERVER_CLIENT_MAX];
+bool     g_wsKick[WEBSOCKETS_SERVER_CLIENT_MAX];
+uint32_t g_wsConnMs[WEBSOCKETS_SERVER_CLIENT_MAX];
+
+String g_ecgMsg, g_vMsg, g_lMsg, g_bMsg, g_aMsg, g_lastAMsg;
+
+// =====================================================================
+//  DSP
+// =====================================================================
+struct HighPass {                       // 1st order, baseline wander
+  float a = 0, xPrev = 0, yPrev = 0;
+  void  design(float fc, float fs) { const float rc = 1.0f / (2.0f * PI * fc); a = rc / (rc + 1.0f / fs); }
+  float process(float x) { const float y = a * (yPrev + x - xPrev); xPrev = x; yPrev = y; return y; }
+  void  reset(float x) { xPrev = x; yPrev = 0; }
+};
+
+struct Biquad {                         // RBJ biquad, transposed direct form II
+  float b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0, z1 = 0, z2 = 0;
+  void set(float n0, float n1, float n2, float d0, float d1, float d2) {
+    b0 = n0 / d0; b1 = n1 / d0; b2 = n2 / d0; a1 = d1 / d0; a2 = d2 / d0;
+  }
+  void notch(float f0, float fs, float q) {
+    const float w = 2.0f * PI * f0 / fs, c = cosf(w), al = sinf(w) / (2.0f * q);
+    set(1.0f, -2.0f * c, 1.0f, 1.0f + al, -2.0f * c, 1.0f - al);
+  }
+  void lowpass(float f0, float fs, float q) {
+    const float w = 2.0f * PI * f0 / fs, c = cosf(w), al = sinf(w) / (2.0f * q);
+    set((1.0f - c) * 0.5f, 1.0f - c, (1.0f - c) * 0.5f, 1.0f + al, -2.0f * c, 1.0f - al);
+  }
+  void highpass(float f0, float fs, float q) {
+    const float w = 2.0f * PI * f0 / fs, c = cosf(w), al = sinf(w) / (2.0f * q);
+    set((1.0f + c) * 0.5f, -(1.0f + c), (1.0f + c) * 0.5f, 1.0f + al, -2.0f * c, 1.0f - al);
+  }
+  float process(float x) {
+    const float y = b0 * x + z1;
+    z1 = b1 * x - a1 * y + z2;
+    z2 = b2 * x - a2 * y;
+    return y;
+  }
+  void reset() { z1 = z2 = 0; }
+};
+
+// Pan-Tompkins style QRS detector: 5-15 Hz band-pass -> derivative ->
+// squaring -> 150 ms moving-window integration -> adaptive threshold, with
+// a 200 ms refractory period, T-wave rejection and an absolute amplitude
+// floor so that noise on a flat line is never counted as a heartbeat.
+struct QrsDetector {
+  Biquad   hp, lp;
+  float    bHist[5];
+  float    mwiBuf[QRS_MWI_LEN], bWin[QRS_MWI_LEN], dWin[QRS_MWI_LEN];
+  uint8_t  idx;
+  uint16_t resum;
+  float    mwiSum, m1, m2, spki, npki, thr, lastQrsSlope;
+  bool     learning, haveQrs;
+  uint32_t learnStart, learnN, lastQrsMs;
+  float    learnMax, learnSum;
+  uint16_t rr[QRS_RR_N];
+  uint8_t  rrN, rrIdx;
+  bool     candValid;                 // best sub-threshold peak since last QRS
+  float    candPk, candSlope;         // (search-back for a missed beat)
+  uint32_t candMs;
+
+  void design() {
+    hp.highpass(5.0f, ECG_FS, 0.7071f);
+    lp.lowpass(15.0f, ECG_FS, 0.7071f);
+  }
+  // (Re)learn thresholds from the next 2 s of signal. Filter state is kept.
+  void startLearning(uint32_t now) {
+    learning = true; learnStart = now; learnN = 0;
+    learnMax = learnSum = 0;
+    haveQrs = false; candValid = false;
+    rrN = rrIdx = 0;
+    lastQrsMs = now;
+  }
+  void reset(uint32_t now) {
+    hp.reset(); lp.reset();
+    memset(bHist, 0, sizeof bHist);
+    memset(mwiBuf, 0, sizeof mwiBuf); memset(bWin, 0, sizeof bWin); memset(dWin, 0, sizeof dWin);
+    idx = 0; resum = 0;
+    mwiSum = m1 = m2 = spki = npki = thr = lastQrsSlope = 0;
+    candPk = candSlope = 0; candMs = now;
+    startLearning(now);
+  }
+  float windowPP() const {
+    float mn = bWin[0], mx = bWin[0];
+    for (int i = 1; i < QRS_MWI_LEN; i++) { if (bWin[i] < mn) mn = bWin[i]; if (bWin[i] > mx) mx = bWin[i]; }
+    return mx - mn;
+  }
+  float windowMaxSlope() const {
+    float mx = 0;
+    for (int i = 0; i < QRS_MWI_LEN; i++) if (dWin[i] > mx) mx = dWin[i];
+    return mx;
+  }
+  float medianRR(uint8_t* consistentPct = nullptr) const {
+    if (rrN == 0) return 0;
+    uint16_t t[QRS_RR_N];
+    for (uint8_t i = 0; i < rrN; i++) t[i] = rr[i];
+    for (uint8_t i = 1; i < rrN; i++) {          // insertion sort, n <= 8
+      const uint16_t v = t[i]; int j = i - 1;
+      while (j >= 0 && t[j] > v) { t[j + 1] = t[j]; j--; }
+      t[j + 1] = v;
+    }
+    const float med = (rrN & 1) ? t[rrN / 2] : 0.5f * (t[rrN / 2 - 1] + t[rrN / 2]);
+    if (consistentPct) {
+      uint8_t ok = 0;
+      for (uint8_t i = 0; i < rrN; i++) if (fabsf(t[i] - med) <= QRS_RR_TOLERANCE * med) ok++;
+      *consistentPct = (uint8_t)(ok * 100 / rrN);
+    }
+    return med;
+  }
+  void accept(float pk, float slope, uint32_t t, bool searchBack) {
+    const uint32_t since = t - lastQrsMs;
+    spki = searchBack ? 0.25f * pk + 0.75f * spki : 0.125f * pk + 0.875f * spki;
+    if (haveQrs && since >= QRS_RR_MIN_MS && since <= QRS_RR_MAX_MS) {
+      rr[rrIdx] = (uint16_t)since;
+      rrIdx = (uint8_t)((rrIdx + 1) % QRS_RR_N);
+      if (rrN < QRS_RR_N) rrN++;
+    }
+    haveQrs = true;
+    lastQrsMs = t;
+    lastQrsSlope = slope;
+    candValid = false;
+  }
+  // Returns true when a QRS complex is detected.
+  bool process(float x, uint32_t now) {
+    const float b = lp.process(hp.process(x));
+    bHist[4] = bHist[3]; bHist[3] = bHist[2]; bHist[2] = bHist[1]; bHist[1] = bHist[0]; bHist[0] = b;
+    const float d  = (2.0f * bHist[0] + bHist[1] - bHist[3] - 2.0f * bHist[4]) * 0.125f;
+    const float sq = d * d;
+    mwiSum += sq - mwiBuf[idx];
+    mwiBuf[idx] = sq; bWin[idx] = b; dWin[idx] = fabsf(d);
+    idx = (uint8_t)((idx + 1) % QRS_MWI_LEN);
+    if (++resum >= 1000) {                       // cancel float drift
+      resum = 0; mwiSum = 0;
+      for (int i = 0; i < QRS_MWI_LEN; i++) mwiSum += mwiBuf[i];
+    }
+    float m = mwiSum / QRS_MWI_LEN;
+    if (m < 0) m = 0;
+
+    bool qrs = false;
+    if (learning) {
+      if (m > learnMax) learnMax = m;
+      learnSum += m; learnN++;
+      if (now - learnStart >= QRS_LEARN_MS) {
+        spki = learnMax / 3.0f;
+        npki = (learnN ? learnSum / learnN : 0) * 0.5f;
+        thr  = npki + 0.25f * (spki - npki);
+        learning = false;
+        lastQrsMs = now;
+      }
+    } else {
+      if (m1 > m2 && m1 >= m) {                  // local MWI peak at previous sample
+        const float    pk       = m1;
+        const uint32_t since    = now - lastQrsMs;
+        const float    slope    = windowMaxSlope();
+        const bool     eligible = since > QRS_REFRACTORY_MS && windowPP() >= QRS_MIN_PP_UV;
+        const bool     tWave    = haveQrs && since < QRS_TWAVE_MS && slope < 0.5f * lastQrsSlope;
+        const bool     artefact = spki > 0 && pk > QRS_ARTEFACT_X * spki;   // motion/electrode pop
+        if (eligible && !tWave && !artefact && pk > thr) {
+          accept(pk, slope, now, false);
+          qrs = true;
+        } else {
+          if (!artefact) npki = 0.125f * pk + 0.875f * npki;   // artefacts must not inflate noise level
+          if (eligible && !tWave && !artefact && pk > 0.5f * thr && (!candValid || pk > candPk)) {
+            candValid = true; candPk = pk; candSlope = slope; candMs = now;
+          }
+        }
+      }
+      // Search-back: no beat for 1.66 x the usual RR -> take the best
+      // half-threshold candidate as the missed beat (Pan-Tompkins).
+      if (!qrs && candValid && rrN >= 2) {
+        const float med = medianRR();
+        if (med > 0 && (now - lastQrsMs) > (uint32_t)(1.66f * med)) {
+          accept(candPk, candSlope, candMs, true);
+          qrs = true;
+        }
+      }
+      // Thresholds learned during an artefact (electrode just attached,
+      // patient moved) can be far too high. Nothing for 3 s -> learn again.
+      if (!qrs && (now - lastQrsMs) > QRS_RELEARN_MS) startLearning(now);
+      thr = npki + 0.25f * (spki - npki);
+    }
+    m2 = m1; m1 = m;
+    return qrs;
+  }
+  // Heart rate from the median RR, or 0 if there are too few beats or the
+  // intervals are too irregular to trust (noise, artefact, missed beats).
+  float hr(uint32_t now) const {
+    if (rrN < QRS_MIN_RR_FOR_HR || (now - lastQrsMs) > QRS_HR_TIMEOUT_MS) return 0;
+    uint8_t pct = 0;
+    const float med = medianRR(&pct);
+    if (med <= 0 || pct < QRS_CONSISTENT_PCT) return 0;
+    return 60000.0f / med;
+  }
+  // A regular rhythm was seen within the last `windowMs`.
+  bool rhythmPresent(uint32_t now, uint32_t windowMs) const {
+    return (now - lastQrsMs) < windowMs && hr(now) > 0;
+  }
+  // Stricter test used to switch leads ON against the LO pins: 8 RR
+  // intervals, >= 85 % within ±15 % of the median, 30–200 bpm. Floating
+  // (disconnected) inputs never produce a rhythm this regular.
+  bool rhythmStrong(uint32_t now, uint32_t windowMs) const {
+    if (rrN < QRS_RR_N || (now - lastQrsMs) >= windowMs) return false;
+    const float med = medianRR();
+    if (med < 300.0f || med > 2000.0f) return false;
+    uint8_t ok = 0;
+    for (uint8_t i = 0; i < rrN; i++) if (fabsf(rr[i] - med) <= 0.15f * med) ok++;
+    return ok * 100 >= 85 * rrN;
+  }
+};
+
+// Sensor-task-only DSP objects (static: keeps ~600 B off the task stack)
+static HighPass    s_hpf;
+static Biquad      s_notch, s_lpf;
+static QrsDetector s_qrs;
+
+// =====================================================================
+//  HTML DASHBOARD
+// =====================================================================
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MedMonitor • Patient Care IoT</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: #f7f9f8;
+    color: #0a0f1f;
+    overflow-y: auto;
+  }
+  .topnav {
+    background: #0a0f1f;
+    color: #fff;
+    padding: 0 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    box-shadow: 0 4px 18px rgba(10, 15, 31, 0.15);
+  }
+  .brand { display: flex; align-items: center; gap: 10px; padding: 10px 0; }
+  .brand-logo {
+    width: 36px; height: 36px;
+    background: #22c55e;
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 19px;
+    box-shadow: 0 4px 12px rgba(34, 197, 94, 0.4);
+  }
+  .brand-text h2 { font-size: 15px; font-weight: 700; letter-spacing: 0.3px; }
+  .brand-text p { font-size: 10px; color: #7b8aa8; margin-top: 1px; }
+  .nav-menu { display: flex; align-items: center; gap: 4px; flex: 1; justify-content: center; }
+  .nav-link {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 16px;
+    color: #a4b1c9;
+    cursor: pointer;
+    font-size: 13px; font-weight: 600;
+    border-radius: 10px;
+    transition: all 0.2s;
+    user-select: none; text-decoration: none;
+  }
+  .nav-link:hover { background: #141c30; color: #fff; }
+  .nav-link.active { background: #22c55e; color: #fff; box-shadow: 0 4px 12px rgba(34, 197, 94, 0.35); }
+  .nav-link .nav-icon { font-size: 15px; }
+  .nav-right { display: flex; align-items: center; gap: 12px; }
+  .live-pill {
+    display: flex; align-items: center; gap: 7px;
+    background: rgba(34, 197, 94, 0.15);
+    border: 1px solid rgba(34, 197, 94, 0.35);
+    color: #4ade80;
+    padding: 5px 12px;
+    border-radius: 20px;
+    font-size: 11px; font-weight: 700; letter-spacing: 0.5px;
+  }
+  .live-pill::before {
+    content: '';
+    width: 7px; height: 7px;
+    background: #22c55e; border-radius: 50%;
+    box-shadow: 0 0 8px #22c55e;
+    animation: pulse 1.5s infinite;
+  }
+  .live-pill.off { background: rgba(239,68,68,0.15); border-color: rgba(239,68,68,0.35); color: #f87171; }
+  .live-pill.off::before { background: #ef4444; box-shadow: 0 0 8px #ef4444; }
+  .clock-top { color: #fff; font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+  .page { display: none; padding: 12px 18px; }
+  .page.active { display: block; animation: fadeIn 0.35s; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+  .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+  .topbar h1 { font-size: 20px; font-weight: 700; }
+  .topbar .sub { font-size: 12px; color: #6b7a99; margin-top: 2px; }
+
+  .patient-banner {
+    background: #0a0f1f;
+    border-radius: 12px;
+    padding: 8px 16px;
+    display: flex; align-items: center; gap: 12px;
+    color: #fff; margin-bottom: 10px; flex-wrap: wrap;
+  }
+  .live-badge {
+    background: #22c55e; padding: 4px 11px; border-radius: 20px;
+    font-size: 11px; font-weight: 700;
+    display: flex; align-items: center; gap: 6px; letter-spacing: 0.5px;
+  }
+  .live-badge::before { content: ''; width: 7px; height: 7px; background: #fff; border-radius: 50%; animation: pulse 1.5s infinite; }
+  .mode-pill {
+    background: rgba(34,197,94,0.15);
+    color: #4ade80; padding: 4px 12px; border-radius: 20px;
+    font-size: 11px; border: 1px solid rgba(34,197,94,0.3); font-weight: 600;
+  }
+  .patient-name {
+    background: rgba(255,255,255,0.08); padding: 4px 13px; border-radius: 20px;
+    font-size: 12px; border: 1px solid rgba(255,255,255,0.15);
+    display: flex; align-items: center; gap: 8px; font-weight: 600;
+  }
+  .patient-meta {
+    background: rgba(255,255,255,0.08); padding: 4px 13px; border-radius: 20px;
+    font-size: 11px; border: 1px solid rgba(255,255,255,0.15); color: #cbd5e1;
+  }
+  .banner-btn {
+    background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.25);
+    color: #fff; padding: 5px 13px; border-radius: 20px;
+    font-size: 11px; font-weight: 700; cursor: pointer; font-family: inherit;
+  }
+  .banner-btn:hover { background: rgba(255,255,255,0.16); }
+  #soundBtn { margin-left: auto; }
+  #soundBtn.warn { background: #dc2626; border-color: #fff; animation: pulse 1s infinite; }
+
+  /* ---------- alarm bar ---------- */
+  .alarm-bar { display: none; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+  .alarm-chip {
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 12px; border-radius: 10px; color: #fff;
+    font-size: 12px; font-weight: 800; letter-spacing: 0.4px;
+  }
+  .alarm-chip.p3 { background: #dc2626; animation: alarmBlink 0.9s infinite; }
+  .alarm-chip.p2 { background: #d97706; }
+  .alarm-chip.p1 { background: #0369a1; }
+  .alarm-chip.silenced { animation: none; opacity: 0.65; }
+  .alarm-chip.standby { background: #334155; }
+  .alarm-chip button {
+    background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.6);
+    color: #fff; border-radius: 6px; padding: 3px 9px;
+    font-weight: 800; font-size: 11px; cursor: pointer; font-family: inherit;
+  }
+  @keyframes alarmBlink { 0%,100% { background: #dc2626; } 50% { background: #7f1d1d; } }
+
+  .section-label {
+    font-size: 11px; font-weight: 700; color: #4a5670;
+    letter-spacing: 1.2px; text-transform: uppercase;
+    margin-bottom: 8px; display: flex; align-items: center; gap: 8px;
+  }
+  .section-label::before {
+    content: ''; width: 7px; height: 7px;
+    background: #22c55e; border-radius: 50%; box-shadow: 0 0 6px #22c55e;
+  }
+
+  .vitals-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 12px; }
+  @media (max-width: 1200px) { .vitals-grid { grid-template-columns: repeat(3, 1fr); } }
+  @media (max-width: 800px)  { .vitals-grid { grid-template-columns: repeat(2, 1fr); } }
+
+  .vital-card {
+    background: #fff;
+    border: 2px solid #e5e7eb;
+    border-radius: 12px;
+    padding: 14px 16px;
+    display: flex; flex-direction: row; align-items: center; gap: 12px;
+    position: relative; transition: all 0.25s ease;
+    min-height: 90px; min-width: 0; overflow: hidden;
+  }
+  .vital-card:hover { border-color: #22c55e; box-shadow: 0 8px 24px rgba(34,197,94,0.15); transform: translateY(-3px); }
+  .vital-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px; background: #22c55e; }
+  .vital-card.warn::before   { background: #f59e0b; }
+  .vital-card.danger::before { background: #ef4444; }
+
+  .vital-icon-wrap {
+    width: 46px; height: 46px; border-radius: 19px;
+    background: #0a0f1f; color: #22c55e;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 19px; flex-shrink: 0;
+    transition: transform 0.12s ease, background-color 0.12s ease;
+  }
+  .vital-icon-wrap.beat { transform: scale(1.25); background: #dc2626; }
+  .vital-card.warn .vital-icon-wrap   { background: #f59e0b; color: #fff; }
+  .vital-card.danger .vital-icon-wrap { background: #ef4444; color: #fff; }
+
+  .vital-title { font-size: 11px; font-weight: 700; color: #4a5670; letter-spacing: 1px; text-transform: uppercase; }
+  .vital-value-row { display: flex; align-items: baseline; gap: 4px; margin-top: 2px; }
+  .vital-value { font-size: 28px; font-weight: 800; color: #0a0f1f; line-height: 1; letter-spacing: -0.5px; }
+  .vital-unit { font-size: 12px; color: #6b7a99; font-weight: 700; }
+  .vital-range { font-size: 10px; color: #8892a6; margin-top: 4px; }
+  .status-badge {
+    position: absolute; top: 9px; right: 9px;
+    font-size: 8px; font-weight: 800; padding: 3px 8px;
+    border-radius: 10px; letter-spacing: 0.6px;
+  }
+  .status-normal { background: #dcfce7; color: #15803d; }
+  .status-warn   { background: #fef3c7; color: #b45309; }
+  .status-danger { background: #fee2e2; color: #b91c1c; }
+  .status-nosig  { background: #e2e8f0; color: #64748b; }
+
+  .ecg-panel { background: #fff; border: 2px solid #e5e7eb; border-radius: 12px; padding: 14px; }
+  .ecg-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+  .ecg-title { display: flex; align-items: center; gap: 10px; font-size: 14px; font-weight: 700; }
+  .ecg-title-icon {
+    width: 32px; height: 32px; background: #22c55e; border-radius: 9px;
+    display: flex; align-items: center; justify-content: center;
+    color: #fff; font-size: 16px;
+  }
+  .ecg-hr { color: #16a34a; font-variant-numeric: tabular-nums; }
+  .lead-pill {
+    background: #0a0f1f; color: #22c55e; padding: 4px 12px; border-radius: 12px;
+    font-size: 10px; font-weight: 800; letter-spacing: 1px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .lead-pill::before { content: ''; width: 6px; height: 6px; background: #22c55e; border-radius: 50%; animation: pulse 1.2s infinite; }
+  .lead-pill.off { background: #450a0a; color: #f87171; }
+  .lead-pill.off::before { background: #ef4444; box-shadow: none; animation: none; }
+  .ecg-canvas-wrap { background: #0a0f1f; border-radius: 10px; padding: 8px; }
+  .ecg-canvas-wrap canvas { display: block; width: 100%; height: 190px; border-radius: 6px; }
+  .canvas-meta {
+    display: flex; justify-content: space-between; padding: 6px 4px 0;
+    font-size: 10px; color: #22c55e;
+    font-family: 'Courier New', monospace; font-weight: 700; letter-spacing: 1px;
+  }
+
+  .record-banner {
+    background: linear-gradient(90deg, #0a0f1f 0%, #1e293b 100%);
+    border-radius: 16px; padding: 22px 26px; color: #fff;
+    display: flex; align-items: center; gap: 22px; margin-bottom: 24px;
+  }
+  .record-avatar {
+    width: 72px; height: 72px; border-radius: 50%; background: #22c55e;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 34px; color: #fff; border: 3px solid rgba(255,255,255,0.15); flex-shrink: 0;
+  }
+  .record-info { flex: 1; }
+  .record-info h2 { font-size: 24px; font-weight: 700; margin-bottom: 6px; }
+  .record-tags { display: flex; gap: 8px; flex-wrap: wrap; font-size: 12px; }
+  .record-tag { background: rgba(255,255,255,0.1); padding: 4px 12px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.15); color: #cbd5e1; }
+  .edit-btn {
+    background: #22c55e; color: #fff; border: none; padding: 10px 22px;
+    border-radius: 10px; font-weight: 700; cursor: pointer; font-size: 14px;
+    box-shadow: 0 4px 12px rgba(34,197,94,0.35); transition: all 0.2s;
+  }
+  .edit-btn:hover { background: #16a34a; transform: translateY(-1px); }
+
+  .form-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; margin-bottom: 20px; }
+  @media (max-width: 900px) { .form-grid { grid-template-columns: 1fr; } }
+  .form-card { background: #fff; border: 2px solid #e5e7eb; border-radius: 14px; padding: 18px 20px; display: flex; align-items: center; gap: 14px; transition: all 0.2s; }
+  .form-card:hover { border-color: #22c55e; }
+  .form-card-icon {
+    width: 46px; height: 46px; border-radius: 12px; background: #ecfdf5; color: #16a34a;
+    display: flex; align-items: center; justify-content: center; font-size: 22px; flex-shrink: 0;
+  }
+  .form-card-body { flex: 1; }
+  .form-card-label { font-size: 10px; font-weight: 800; color: #8892a6; letter-spacing: 1.2px; text-transform: uppercase; margin-bottom: 4px; }
+  .form-card-value { font-size: 17px; font-weight: 700; color: #0a0f1f; white-space: pre-wrap; }
+  .form-card-value.empty { color: #cbd5e1; font-weight: 500; }
+
+  .form-edit-panel {
+    background: #fff; border: 2px solid #22c55e; border-radius: 16px;
+    padding: 26px; margin-bottom: 20px; display: none;
+    box-shadow: 0 8px 24px rgba(34,197,94,0.12);
+  }
+  .form-edit-panel.show { display: block; animation: fadeIn 0.3s; }
+  .form-edit-panel h3 { font-size: 16px; font-weight: 700; margin-bottom: 18px; color: #0a0f1f; display: flex; align-items: center; gap: 10px; }
+  .form-edit-panel h3::before { content: '✏️'; font-size: 18px; }
+  .edit-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 20px; }
+  @media (max-width: 900px) { .edit-grid { grid-template-columns: 1fr; } }
+  .edit-field label { display: block; font-size: 11px; font-weight: 800; color: #4a5670; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 6px; }
+  .edit-field input, .edit-field select, .edit-field textarea {
+    width: 100%; padding: 11px 14px; border: 2px solid #e5e7eb; border-radius: 10px;
+    font-size: 14px; font-family: inherit; background: #f9fafb; color: #0a0f1f;
+    transition: all 0.2s; outline: none;
+  }
+  .edit-field input:focus, .edit-field select:focus, .edit-field textarea:focus {
+    border-color: #22c55e; background: #fff; box-shadow: 0 0 0 4px rgba(34,197,94,0.12);
+  }
+  .edit-field.full { grid-column: 1 / -1; }
+  .edit-field textarea { resize: vertical; min-height: 90px; }
+  .form-actions { display: flex; gap: 12px; justify-content: flex-end; }
+  .btn { padding: 11px 24px; border-radius: 10px; font-weight: 700; font-size: 14px; cursor: pointer; border: none; transition: all 0.2s; }
+  .btn-primary { background: #22c55e; color: #fff; box-shadow: 0 4px 12px rgba(34,197,94,0.35); }
+  .btn-primary:hover { background: #16a34a; transform: translateY(-1px); }
+  .btn-secondary { background: #f1f5f9; color: #4a5670; }
+  .btn-secondary:hover { background: #e2e8f0; }
+
+  .alert-overlay {
+    position: fixed; inset: 0; background: rgba(10,15,31,0.75);
+    display: none; align-items: center; justify-content: center;
+    z-index: 999; backdrop-filter: blur(6px);
+  }
+  .alert-overlay.show { display: flex; animation: fadeIn 0.3s; }
+  .alert-box {
+    background: linear-gradient(135deg, #dc2626, #991b1b);
+    border-radius: 20px; padding: 40px 60px; text-align: center; color: #fff;
+    box-shadow: 0 20px 60px rgba(220,38,38,0.5);
+    animation: shake 0.5s infinite alternate; border: 4px solid #fff;
+    max-width: 92vw;
+  }
+  @keyframes shake { from { transform: translateX(-3px); } to { transform: translateX(3px); } }
+  .alert-box .icon { font-size: 64px; margin-bottom: 12px; }
+  .alert-box h2 { font-size: 28px; margin-bottom: 8px; letter-spacing: 1px; }
+  .alert-box p  { font-size: 16px; opacity: 0.9; margin-bottom: 20px; }
+  .alert-box button { background: #fff; color: #dc2626; border: none; padding: 12px 32px; border-radius: 10px; font-weight: 700; font-size: 15px; cursor: pointer; }
+  .alert-box small { display: block; margin-top: 12px; font-size: 11px; opacity: 0.8; }
+
+  /* ---------- data logging ---------- */
+  .rec-pill {
+    display: none; align-items: center; gap: 6px;
+    background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.4);
+    color: #f87171; padding: 5px 12px; border-radius: 20px;
+    font-size: 11px; font-weight: 800; letter-spacing: 0.5px; cursor: pointer;
+  }
+  .rec-pill.show { display: flex; }
+  .rec-pill::before { content: ''; width: 8px; height: 8px; background: #ef4444; border-radius: 50%; animation: pulse 1s infinite; }
+  .log-panel { padding: 18px 20px; }
+  .log-controls { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+  .log-interval { min-width: 170px; }
+  .log-start { background: #22c55e; color: #fff; box-shadow: 0 4px 12px rgba(34,197,94,0.35); }
+  .log-start:hover:not(:disabled) { background: #16a34a; }
+  .log-stop { background: #ef4444; color: #fff; box-shadow: 0 4px 12px rgba(239,68,68,0.3); }
+  .log-stop:hover:not(:disabled) { background: #dc2626; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none; transform: none; }
+  .log-status { margin-top: 16px; border-top: 1px solid #e5e7eb; padding-top: 14px; }
+  .log-state { font-size: 14px; font-weight: 800; letter-spacing: 1px; color: #64748b; margin-bottom: 10px; }
+  .log-state.rec { color: #dc2626; }
+  .log-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  @media (max-width: 800px) { .log-stats { grid-template-columns: repeat(2, 1fr); } }
+  .log-stats > div { background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 10px; padding: 10px 12px; }
+  .log-k { display: block; font-size: 10px; font-weight: 800; color: #8892a6; letter-spacing: 1px; text-transform: uppercase; }
+  .log-v { display: block; font-size: 16px; font-weight: 700; color: #0a0f1f; margin-top: 3px; font-variant-numeric: tabular-nums; }
+  .log-bar { height: 6px; background: #e5e7eb; border-radius: 3px; margin-top: 12px; overflow: hidden; }
+  .log-bar-fill { height: 100%; width: 0%; background: #22c55e; transition: width 0.4s; }
+  .log-bar-fill.high { background: #f59e0b; }
+  .log-msg { font-size: 12px; color: #b45309; margin-top: 8px; min-height: 16px; }
+  .log-table-wrap { padding: 0; overflow-x: auto; }
+  .log-table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+  .log-table th { text-align: left; font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: #64748b; background: #f8fafc; padding: 10px 12px; border-bottom: 2px solid #e5e7eb; white-space: nowrap; }
+  .log-table td { padding: 8px 12px; border-bottom: 1px solid #f1f5f9; white-space: nowrap; }
+  .log-table td.alarm { color: #dc2626; font-weight: 700; }
+  .log-empty { text-align: center; color: #94a3b8; padding: 24px !important; }
+</style>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="brand">
+    <div class="brand-logo">💓</div>
+    <div class="brand-text">
+      <h2>MedMonitor</h2>
+      <p>Patient Care IoT</p>
+    </div>
+  </div>
+  <div class="nav-menu">
+    <a class="nav-link active" data-page="dashboard"><span class="nav-icon">💗</span> Vitals Monitor</a>
+    <a class="nav-link" data-page="patient"><span class="nav-icon">👤</span> Patient Record</a>
+    <a class="nav-link" data-page="logging"><span class="nav-icon">📊</span> Data Logging</a>
+  </div>
+  <div class="nav-right">
+    <div class="live-pill" id="navLive">LIVE</div>
+    <div class="rec-pill" id="recPill" onclick="showPage('logging')">REC</div>
+    <div class="clock-top" id="clockTop">--:--:--</div>
+  </div>
+</nav>
+
+<!-- ============ PAGE: DASHBOARD ============ -->
+<section class="page active" id="page-dashboard">
+  <div class="patient-banner">
+    <div class="live-badge">LIVE</div>
+    <div class="mode-pill">🏥 PROTOTYPE MONITOR</div>
+    <div class="patient-name" id="bannerPatientName">👤 No patient saved</div>
+    <div class="patient-meta" id="bannerPatientMeta" style="display:none;"></div>
+    <button class="banner-btn" id="soundBtn" onclick="enableSound()">🔔 Enable alarm sound</button>
+    <button class="banner-btn" id="standbyBtn" onclick="toggleStandby()">⏸ Standby</button>
+  </div>
+
+  <div class="alarm-bar" id="alarmBar"></div>
+
+  <div class="section-label">Live Vitals</div>
+
+  <div class="vitals-grid">
+    <div class="vital-card" id="cardBpm">
+      <span class="status-badge status-normal" id="bpmStatus">NORMAL</span>
+      <div class="vital-icon-wrap" id="bpmIcon">❤️</div>
+      <div>
+        <div class="vital-title">Heart Rate</div>
+        <div class="vital-value-row">
+          <div class="vital-value" id="bpmVal">--</div>
+          <div class="vital-unit">BPM</div>
+        </div>
+        <div class="vital-range" id="bpmRange">60 – 100 BPM</div>
+      </div>
+    </div>
+
+    <div class="vital-card" id="cardSpo2">
+      <span class="status-badge status-normal" id="spo2Status">NORMAL</span>
+      <div class="vital-icon-wrap">🫁</div>
+      <div>
+        <div class="vital-title">Blood Oxygen</div>
+        <div class="vital-value-row">
+          <div class="vital-value" id="spo2Val">--</div>
+          <div class="vital-unit">%</div>
+        </div>
+        <div class="vital-range" id="spo2Range">95 – 100%</div>
+      </div>
+    </div>
+
+    <div class="vital-card" id="cardTemp">
+      <span class="status-badge status-normal" id="tempStatus">NORMAL</span>
+      <div class="vital-icon-wrap">🌡️</div>
+      <div>
+        <div class="vital-title">Skin Temp</div>
+        <div class="vital-value-row">
+          <div class="vital-value" id="tempVal">--</div>
+          <div class="vital-unit">°C</div>
+        </div>
+        <div class="vital-range" id="tempRange">36.1 – 37.2 °C</div>
+      </div>
+    </div>
+
+    <div class="vital-card" id="cardRoom">
+      <span class="status-badge status-normal" id="roomStatus">NORMAL</span>
+      <div class="vital-icon-wrap">🏠</div>
+      <div>
+        <div class="vital-title">Room Temp</div>
+        <div class="vital-value-row">
+          <div class="vital-value" id="roomVal">--</div>
+          <div class="vital-unit">°C</div>
+        </div>
+        <div class="vital-range" id="roomRange">20 – 26 °C</div>
+      </div>
+    </div>
+
+    <div class="vital-card" id="cardHumid">
+      <span class="status-badge status-normal" id="humidStatus">NORMAL</span>
+      <div class="vital-icon-wrap">💧</div>
+      <div>
+        <div class="vital-title">Humidity</div>
+        <div class="vital-value-row">
+          <div class="vital-value" id="humidVal">--</div>
+          <div class="vital-unit">%</div>
+        </div>
+        <div class="vital-range" id="humidRange">30 – 60 %</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-label">ECG Waveform</div>
+  <div class="ecg-panel">
+    <div class="ecg-header">
+      <div class="ecg-title">
+        <div class="ecg-title-icon">📈</div>
+        Electrocardiogram • Lead I <span class="ecg-hr" id="ecgHrTag"></span>
+      </div>
+      <div class="lead-pill" id="leadPill">LIVE</div>
+    </div>
+    <div class="ecg-canvas-wrap">
+      <canvas id="ecg" width="1800" height="190"></canvas>
+      <div class="canvas-meta">
+        <span>AUTO GAIN • BAR = AMPLITUDE SCALE</span>
+        <span>250 Hz • 0.5–40 Hz • MAINS NOTCH • 0.2 s/DIV</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ PAGE: PATIENT RECORD ============ -->
+<section class="page" id="page-patient">
+  <div class="topbar">
+    <div>
+      <h1>Patient Record</h1>
+      <div class="sub">Stored on the monitor — every logged-in viewer sees the same record</div>
+    </div>
+  </div>
+
+  <div class="record-banner">
+    <div class="record-avatar" id="recAvatar">?</div>
+    <div class="record-info">
+      <h2 id="recName">No patient saved</h2>
+      <div class="record-tags">
+        <span class="record-tag" id="recIdTag">No ID</span>
+        <span class="record-tag" id="recBedTag">Bed: --</span>
+        <span class="record-tag" id="recWardTag">Ward: --</span>
+      </div>
+    </div>
+    <button class="edit-btn" onclick="toggleEdit()">✏️ Edit</button>
+  </div>
+
+  <div class="section-label">Personal Information</div>
+  <div class="form-grid">
+    <div class="form-card">
+      <div class="form-card-icon">🎂</div>
+      <div class="form-card-body">
+        <div class="form-card-label">Age</div>
+        <div class="form-card-value empty" id="viewAge">--</div>
+      </div>
+    </div>
+    <div class="form-card">
+      <div class="form-card-icon">⚧</div>
+      <div class="form-card-body">
+        <div class="form-card-label">Gender</div>
+        <div class="form-card-value empty" id="viewGender">--</div>
+      </div>
+    </div>
+    <div class="form-card">
+      <div class="form-card-icon">🩸</div>
+      <div class="form-card-body">
+        <div class="form-card-label">Blood Group</div>
+        <div class="form-card-value empty" id="viewBlood">--</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-label">Contact & ID</div>
+  <div class="form-grid">
+    <div class="form-card">
+      <div class="form-card-icon">📞</div>
+      <div class="form-card-body">
+        <div class="form-card-label">Phone</div>
+        <div class="form-card-value empty" id="viewPhone">--</div>
+      </div>
+    </div>
+    <div class="form-card">
+      <div class="form-card-icon">🆔</div>
+      <div class="form-card-body">
+        <div class="form-card-label">Patient ID</div>
+        <div class="form-card-value empty" id="viewId">--</div>
+      </div>
+    </div>
+    <div class="form-card">
+      <div class="form-card-icon">🏥</div>
+      <div class="form-card-body">
+        <div class="form-card-label">Bed / Ward</div>
+        <div class="form-card-value empty" id="viewBed">--</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-label">Clinical Notes</div>
+  <div class="form-card" style="margin-bottom:20px;">
+    <div class="form-card-icon">📝</div>
+    <div class="form-card-body">
+      <div class="form-card-label">Notes</div>
+      <div class="form-card-value empty" id="viewNotes">No notes added.</div>
+    </div>
+  </div>
+
+  <div class="form-edit-panel" id="editPanel">
+    <h3>Edit Patient Information</h3>
+    <div class="edit-grid">
+      <div class="edit-field"><label>Full Name</label><input type="text" id="inName" maxlength="48" placeholder="e.g. Eric Boseman"></div>
+      <div class="edit-field"><label>Age</label><input type="number" id="inAge" placeholder="e.g. 45" min="0" max="120"></div>
+      <div class="edit-field">
+        <label>Gender</label>
+        <select id="inGender"><option value="">-- Select --</option><option>Male</option><option>Female</option><option>Other</option></select>
+      </div>
+      <div class="edit-field">
+        <label>Blood Group</label>
+        <select id="inBlood"><option value="">-- Select --</option><option>A+</option><option>A-</option><option>B+</option><option>B-</option><option>AB+</option><option>AB-</option><option>O+</option><option>O-</option></select>
+      </div>
+      <div class="edit-field"><label>Phone</label><input type="tel" id="inPhone" maxlength="20" placeholder="e.g. +91 9876543210"></div>
+      <div class="edit-field"><label>Patient ID</label><input type="text" id="inId" maxlength="24" placeholder="e.g. PT-00123"></div>
+      <div class="edit-field"><label>Bed</label><input type="text" id="inBed" maxlength="12" placeholder="e.g. B-12"></div>
+      <div class="edit-field"><label>Ward</label><input type="text" id="inWard" maxlength="24" placeholder="e.g. ICU-A"></div>
+      <div class="edit-field full"><label>Clinical Notes</label><textarea id="inNotes" maxlength="300" placeholder="Any additional info..."></textarea></div>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-secondary" onclick="cancelEdit()">Cancel</button>
+      <button class="btn btn-primary" onclick="savePatient()">💾 Save Patient</button>
+    </div>
+  </div>
+</section>
+
+<!-- ============ PAGE: DATA LOGGING ============ -->
+<section class="page" id="page-logging">
+  <div class="topbar">
+    <div>
+      <h1>Data Logging</h1>
+      <div class="sub">Recording runs on the monitor — it continues even if this page is closed</div>
+    </div>
+  </div>
+
+  <div class="ecg-panel log-panel">
+    <div class="log-controls">
+      <div class="edit-field log-interval">
+        <label>Record every</label>
+        <select id="logInterval">
+          <option value="1">1 second</option>
+          <option value="2">2 seconds</option>
+          <option value="5" selected>5 seconds</option>
+          <option value="10">10 seconds</option>
+          <option value="30">30 seconds</option>
+          <option value="60">1 minute</option>
+        </select>
+      </div>
+      <button class="btn log-start" id="logStartBtn" onclick="logStart()">⏺ Start</button>
+      <button class="btn log-stop" id="logStopBtn" onclick="logStop()">⏹ Stop</button>
+      <button class="btn btn-secondary" id="logDlBtn" onclick="logDownload()">⬇ Download CSV</button>
+    </div>
+
+    <div class="log-status">
+      <div class="log-state" id="logState">● STOPPED</div>
+      <div class="log-stats">
+        <div><span class="log-k">Started</span><span class="log-v" id="logStarted">--</span></div>
+        <div><span class="log-k">Duration</span><span class="log-v" id="logDuration">--</span></div>
+        <div><span class="log-k">Rows</span><span class="log-v" id="logRows">0</span></div>
+        <div><span class="log-k">Storage</span><span class="log-v" id="logStorage">--</span></div>
+      </div>
+      <div class="log-bar"><div class="log-bar-fill" id="logBarFill"></div></div>
+      <div class="log-msg" id="logMsg"></div>
+    </div>
+  </div>
+
+  <div class="section-label" style="margin-top:14px;">Latest Rows</div>
+  <div class="ecg-panel log-table-wrap">
+    <table class="log-table">
+      <thead>
+        <tr><th>Time</th><th>HR</th><th>Pulse</th><th>ECG HR</th><th>SpO₂</th><th>Skin °C</th><th>Room °C</th><th>RH %</th><th>Leads</th><th>Alarms</th></tr>
+      </thead>
+      <tbody id="logRowsBody"><tr><td colspan="10" class="log-empty">No data yet — press Start</td></tr></tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============ ALERT MODAL (critical alarms) ============ -->
+<div class="alert-overlay" id="alertOverlay">
+  <div class="alert-box">
+    <div class="icon">🚨</div>
+    <h2>CRITICAL ALARM</h2>
+    <p id="alertMsg">Patient condition abnormal</p>
+    <button onclick="ackTop()">ACKNOWLEDGE (silence 2 min)</button>
+    <small>The alarm stays listed until the condition clears.</small>
+  </div>
+</div>
+
+<script>
+/* ================= CLOCK ================= */
+setInterval(() => {
+  document.getElementById('clockTop').textContent = new Date().toLocaleTimeString();
+}, 1000);
+
+/* ================= PAGE NAVIGATION ================= */
+let currentPage = 'dashboard';
+function showPage(page) {
+  document.querySelectorAll('.nav-link').forEach(l => l.classList.toggle('active', l.dataset.page === page));
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.getElementById('page-' + page).classList.add('active');
+  currentPage = page;
+  if (page === 'patient') fetchPatient();
+  if (page === 'logging') logRefresh();
+}
+document.querySelectorAll('.nav-link').forEach(link => {
+  link.addEventListener('click', () => showPage(link.dataset.page));
+});
+
+/* ================= ECG CANVAS ================= */
+// Samples arrive filtered (0.5–40 Hz + mains notch) on the ESP32, in µV
+// referred to the electrodes, 250 Hz, batches of 10. 1000 points = 4 s.
+const canvas = document.getElementById('ecg');
+const ctx = canvas.getContext('2d');
+const ECG_FS = 250;
+const MAX_POINTS = 1000;
+const PX_PER_SEC = canvas.width / (MAX_POINTS / ECG_FS);   // 450 px/s
+const data = new Float32Array(MAX_POINTS);                   // ring buffer
+let head = 0;
+let gain = 0.06;                                             // px per µV (auto)
+
+let leadOffUI = false;
+let lastDataMs = 0;
+let dirty = false;
+let lastDrawMs = 0;
+
+function pushSample(v) { data[head] = v; head = (head + 1) % MAX_POINTS; }
+
+function drawGrid() {
+  ctx.fillStyle = '#0a0f1f';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const minor = PX_PER_SEC * 0.04, major = PX_PER_SEC * 0.2;   // ECG paper: 1 mm / 5 mm
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = 'rgba(34, 197, 94, 0.08)';
+  for (let x = 0; x < canvas.width; x += minor) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke(); }
+  for (let y = 0; y < canvas.height; y += minor) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke(); }
+  ctx.strokeStyle = 'rgba(34, 197, 94, 0.2)';
+  for (let x = 0; x < canvas.width; x += major) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke(); }
+  for (let y = 0; y < canvas.height; y += major) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke(); }
+}
+
+function drawScaleBar(half) {
+  let mv = 1;
+  if (1000 * gain > canvas.height - 30) mv = 0.5;
+  if (mv * 1000 * gain > canvas.height - 30) mv = 0.2;
+  const h = mv * 1000 * gain;
+  const x = 18, top = half - h / 2, bot = half + h / 2;
+  ctx.strokeStyle = '#e2e8f0'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(x - 6, bot); ctx.lineTo(x, bot); ctx.lineTo(x, top); ctx.lineTo(x + 6, top);
+  ctx.stroke();
+  ctx.fillStyle = '#e2e8f0'; ctx.font = 'bold 14px Courier New, monospace'; ctx.textAlign = 'left';
+  ctx.fillText(mv + ' mV', x + 10, top + 5);
+}
+
+function draw() {
+  drawGrid();
+
+  // Auto-gain, but never amplify a near-flat trace (noise must not look like beats).
+  let mn = Infinity, mx = -Infinity;
+  for (let i = 0; i < MAX_POINTS; i++) { const v = data[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
+  const p2p = mx - mn;
+  let target = 0.06;                    // 1 mV = 60 px when there is no signal
+  if (p2p > 100) {                      // > 100 µV peak-to-peak
+    target = (canvas.height * 0.75) / p2p;
+    if (target > 0.6) target = 0.6;
+    if (target < 0.01) target = 0.01;
+  }
+  gain += (target - gain) * 0.08;
+
+  const half = canvas.height / 2;
+  const mid = (mx + mn) / 2;
+  ctx.strokeStyle = '#22c55e';
+  ctx.lineWidth = 2.2;
+  ctx.shadowColor = '#22c55e';
+  ctx.shadowBlur = 8;
+  ctx.beginPath();
+  for (let i = 0; i < MAX_POINTS; i++) {
+    const v = data[(head + i) % MAX_POINTS];
+    const x = (i / MAX_POINTS) * canvas.width;
+    let y = half - (v - mid) * gain;
+    if (y < 6) y = 6;
+    if (y > canvas.height - 6) y = canvas.height - 6;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+  drawScaleBar(half);
+
+  if (leadOffUI) {
+    const [l1, l2] = leadOffDetail(leadReason);
+    ctx.fillStyle = 'rgba(10, 15, 31, 0.85)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ef4444';
+    ctx.font = 'bold 34px Courier New, monospace';
+    ctx.fillText(l1, canvas.width / 2, half - 12);
+    ctx.fillStyle = '#fbbf24';
+    ctx.font = 'bold 22px Courier New, monospace';
+    ctx.fillText(l2, canvas.width / 2, half + 26);
+  } else if (Date.now() - lastDataMs > 700) {
+    ctx.fillStyle = 'rgba(10, 15, 31, 0.85)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fbbf24';
+    ctx.font = 'bold 30px Courier New, monospace';
+    ctx.fillText('NO ECG DATA — check monitor connection', canvas.width / 2, half + 10);
+  }
+}
+
+function animLoop() {
+  const t = Date.now();
+  if (dirty || t - lastDrawMs > 300) { draw(); lastDrawMs = t; dirty = false; }
+  requestAnimationFrame(animLoop);
+}
+requestAnimationFrame(animLoop);
+
+/* ================= WEBSOCKET (token auth + auto-reconnect) ================= */
+let ws = null;
+let lastMsgMs = Date.now();
+
+async function connectWS() {
+  let token;
+  try {
+    const r = await fetch('/api/token', { cache: 'no-store' });
+    if (!r.ok) throw new Error('token ' + r.status);
+    token = (await r.text()).trim();
+  } catch (e) { setTimeout(connectWS, 2000); return; }
+  ws = new WebSocket('ws://' + location.hostname + ':81/');
+  ws.onopen = () => ws.send('T:' + token);
+  ws.onmessage = (e) => { lastMsgMs = Date.now(); handleWSMessage(e.data); };
+  ws.onclose = () => setTimeout(connectWS, 2000);
+  ws.onerror = () => { try { ws.close(); } catch (err) {} };
+}
+function wsSend(s) { if (ws && ws.readyState === 1) { ws.send(s); return true; } return false; }
+
+function handleWSMessage(msg) {
+  if (!msg || msg.length < 2) return;
+  const tag = msg.substring(0, 2);
+
+  if (tag === 'E:') {                     // ECG batch (µV)
+    const parts = msg.substring(2).split(',');
+    for (let i = 0; i < parts.length; i++) { const v = parseInt(parts[i], 10); if (!isNaN(v)) pushSample(v); }
+    lastDataMs = Date.now(); dirty = true;
+    return;
+  }
+  if (tag === 'L:') {                     // "L:<off>:<reason bits>"
+    leadOffUI = (msg.charAt(2) === '1');
+    leadReason = parseInt(msg.substring(4), 10) || 0;
+    updateLeadPill(); dirty = true;
+    return;
+  }
+  if (tag === 'B:') { blinkHeart(); return; }
+  if (tag === 'A:') { handleAlarmMsg(msg.substring(2)); return; }
+  if (tag === 'V:') {                     // vitals snapshot (1 Hz)
+    const p = msg.substring(2).split(',');
+    if (p.length < 12) return;
+    leadReason = parseInt(p[8], 10) || 0;
+    poState = parseInt(p[9], 10) || 0;
+    poQuality = parseInt(p[10], 10) || 0;
+    poPi = (parseInt(p[11], 10) || 0) / 10;
+    updateVitals(parseInt(p[0]), parseInt(p[1]), parseFloat(p[2]), parseFloat(p[3]),
+                 parseFloat(p[4]), p[5] === '1', parseInt(p[6]), parseInt(p[7]));
+  }
+}
+
+/* ================= UI UPDATE ================= */
+// Pulse-sensor state — must match PO_* in the firmware
+const PO_MISSING = 0, PO_NOFINGER = 1, PO_ADJUSTING = 2, PO_WEAK = 3, PO_GOOD = 4;
+let poState = PO_MISSING, poQuality = 0, poPi = 0;
+function poStatusText() {
+  switch (poState) {
+    case PO_MISSING:   return 'Pulse sensor not detected — check wiring';
+    case PO_NOFINGER:  return 'Place fingertip on the sensor';
+    case PO_ADJUSTING: return 'Adjusting light… hold still';
+    case PO_WEAK:      return 'Weak signal or movement — hold still';
+    default:           return 'Measuring…';
+  }
+}
+
+// Lead-off reason bits — must match LEAD_* in the firmware
+const LEAD_LO_PLUS = 1, LEAD_LO_MINUS = 2, LEAD_SATURATED = 4, LEAD_CLIPPING = 8, LEAD_LO_IGNORED = 16;
+let leadReason = LEAD_LO_PLUS | LEAD_LO_MINUS;
+
+function leadOffDetail(r) {
+  if (r & LEAD_SATURATED) return ['⚠  AMPLIFIER SATURATED', 'Check RL (right-leg) electrode & skin contact, keep still'];
+  if ((r & LEAD_LO_PLUS) && (r & LEAD_LO_MINUS)) return ['⚠  ELECTRODES NOT CONNECTED', 'LO+ and LO− high: attach RA, LA and RL electrodes'];
+  if (r & LEAD_LO_PLUS)  return ['⚠  LA ELECTRODE NOT DETECTED', 'LO+ high (+IN): check LA electrode, gel and cable'];
+  if (r & LEAD_LO_MINUS) return ['⚠  RA ELECTRODE NOT DETECTED', 'LO− high (−IN): check RA electrode, gel and cable'];
+  return ['⚠  ECG SIGNAL LOST', 'Check electrodes and cable'];
+}
+
+function updateLeadPill() {
+  const pill = document.getElementById('leadPill');
+  const nav  = document.getElementById('navLive');
+  if (leadOffUI) {
+    pill.textContent = 'LEADS OFF'; pill.classList.add('off');
+    nav.textContent  = 'LEADS OFF'; nav.classList.add('off');
+  } else {
+    let t = 'LIVE';
+    if (leadReason & LEAD_CLIPPING)   t += ' • CLIPPING';
+    if (leadReason & LEAD_LO_IGNORED) t += ' • CHECK ELECTRODE GEL';
+    pill.textContent = t; pill.classList.remove('off');
+    nav.textContent  = 'LIVE';  nav.classList.remove('off');
+  }
+}
+
+function blinkHeart() {
+  const el = document.getElementById('bpmIcon');
+  if (!el) return;
+  el.classList.add('beat');
+  setTimeout(() => el.classList.remove('beat'), 140);
+}
+
+function applyVital(name, value, classify, normalRange, noSigRange) {
+  const badge = document.getElementById(name + 'Status');
+  const card  = document.getElementById('card' + name[0].toUpperCase() + name.slice(1));
+  const range = document.getElementById(name + 'Range');
+  let level;
+  if (value === 0 || isNaN(value)) {
+    level = 'nosig';
+    if (range && noSigRange) range.textContent = noSigRange;
+  } else {
+    level = classify(value);
+    if (range) range.textContent = normalRange;
+  }
+  badge.className = 'status-badge status-' + level;
+  badge.textContent = level === 'nosig' ? 'NO SIG' : level === 'normal' ? 'NORMAL' : level.toUpperCase();
+  card.classList.remove('warn', 'danger');
+  if (level === 'warn')   card.classList.add('warn');
+  if (level === 'danger') card.classList.add('danger');
+}
+
+function updateVitals(bpm, spo2, temp, room, humid, leadOff, ecgHr, pulseHr) {
+  leadOffUI = leadOff;
+  updateLeadPill();
+
+  document.getElementById('bpmVal').textContent   = bpm  > 0 ? bpm  : '--';
+  document.getElementById('spo2Val').textContent  = spo2 > 0 ? spo2 : '--';
+  document.getElementById('tempVal').textContent  = temp > 0 ? temp.toFixed(1) : '--';
+  document.getElementById('roomVal').textContent  = room > 0 ? room.toFixed(1) : '--';
+  document.getElementById('humidVal').textContent = humid > 0 ? humid.toFixed(1) : '--';
+  document.getElementById('ecgHrTag').textContent = ecgHr > 0 ? '• ' + ecgHr + ' bpm' : '';
+
+  // Card value = stabilised pulse-oximeter rate (ECG rate only as reference)
+  let src;
+  if (pulseHr > 0)    src = 'Pulse oximeter' + (ecgHr > 0 ? ' • ECG ' + ecgHr : '');
+  else if (bpm > 0)   src = 'From ECG (no finger on sensor)';
+  else                src = '60 – 100 BPM';
+  const sigText = poState === PO_GOOD
+    ? 'Signal good • PI ' + poPi.toFixed(1) + '%'
+    : (poState === PO_WEAK || poState === PO_ADJUSTING ? poStatusText() + ' (last value)' : poStatusText());
+
+  applyVital('bpm', bpm,
+    v => (v < 50 || v > 120) ? 'danger' : ((v < 60 || v > 100) ? 'warn' : 'normal'),
+    poState === PO_GOOD ? src : (pulseHr > 0 ? sigText : src), poStatusText());
+  applyVital('spo2', spo2,
+    v => v < 90 ? 'danger' : (v < 95 ? 'warn' : 'normal'),
+    poState === PO_GOOD ? '95 – 100% • ' + sigText : sigText, poStatusText());
+  applyVital('temp', temp,
+    v => (v > 39 || v < 35) ? 'danger' : ((v > 37.5 || v < 36) ? 'warn' : 'normal'),
+    '36.1 – 37.2 °C', 'Temperature probe not reading');
+  applyVital('room', room,
+    v => (v > 32 || v < 15) ? 'danger' : ((v > 28 || v < 18) ? 'warn' : 'normal'),
+    '20 – 26 °C', null);
+  applyVital('humid', humid,
+    v => (v > 80 || v < 20) ? 'danger' : ((v > 65 || v < 30) ? 'warn' : 'normal'),
+    '30 – 60 %', null);
+}
+
+/* ================= ALARMS (evaluated on the monitor) ================= */
+// Order MUST match the AlarmId enum in the firmware.
+const ALARM_TEXT = [
+  'ASYSTOLE — no QRS detected for 4 s',
+  'HEART RATE CRITICALLY LOW (< 40 bpm)',
+  'HEART RATE CRITICALLY HIGH (> 200 bpm)',
+  'SpO₂ CRITICALLY LOW (< 88 %)',
+  'HIGH TEMPERATURE (> 39.5 °C)',
+  'LOW TEMPERATURE (< 31 °C)',
+  'ECG LEADS OFF — reattach electrodes',
+  'NO PULSE SIGNAL — check finger sensor',
+  'PULSE OXIMETER DISCONNECTED',
+  'TEMPERATURE PROBE DISCONNECTED',
+];
+let alarms = [];
+let standby = false;
+let connLost = false;
+
+function handleAlarmMsg(s) {
+  const bar = s.indexOf('|');
+  standby = s.substring(0, bar) === '1';
+  alarms = s.substring(bar + 1).split(';').filter(x => x).map(e => {
+    const f = e.split(',').map(Number);
+    return { id: f[0], prio: f[1], silenced: f[2] === 1 };
+  });
+  alarms.sort((a, b) => b.prio - a.prio);
+  renderAlarms();
+}
+
+function renderAlarms() {
+  const bar = document.getElementById('alarmBar');
+  bar.textContent = '';
+  const add = (cls, text, ackId) => {
+    const d = document.createElement('div');
+    d.className = 'alarm-chip ' + cls;
+    const s = document.createElement('span');
+    s.textContent = text;
+    d.appendChild(s);
+    if (ackId !== undefined) {
+      const b = document.createElement('button');
+      b.textContent = 'ACK';
+      b.onclick = () => ackAlarm(ackId);
+      d.appendChild(b);
+    }
+    bar.appendChild(d);
+  };
+  if (connLost) add('p2', '⚠ NO DATA FROM MONITOR — check WiFi / power');
+  if (standby)  add('standby', '⏸ STANDBY — alarms paused');
+  for (const a of alarms) {
+    add('p' + a.prio + (a.silenced ? ' silenced' : ''),
+        (a.silenced ? '🔕 ' : '') + (ALARM_TEXT[a.id] || ('ALARM ' + a.id)),
+        a.silenced ? undefined : a.id);
+  }
+  bar.style.display = bar.childElementCount ? 'flex' : 'none';
+
+  const top = alarms.find(a => a.prio === 3 && !a.silenced);
+  const ov = document.getElementById('alertOverlay');
+  if (top) {
+    document.getElementById('alertMsg').textContent = ALARM_TEXT[top.id] || ('ALARM ' + top.id);
+    ov.dataset.id = top.id;
+    ov.classList.add('show');
+  } else {
+    ov.classList.remove('show');
+  }
+
+  document.getElementById('standbyBtn').textContent = standby ? '▶ Resume monitoring' : '⏸ Standby';
+  const sb = document.getElementById('soundBtn');
+  sb.style.display = audioCtx ? 'none' : 'block';
+  sb.classList.toggle('warn', !audioCtx && (alarms.some(a => !a.silenced) || connLost));
+}
+
+function ackAlarm(id) { wsSend('K:' + id); }
+function ackTop() {
+  const id = document.getElementById('alertOverlay').dataset.id;
+  if (id !== undefined) ackAlarm(parseInt(id, 10));
+}
+function toggleStandby() {
+  if (!standby && !confirm('Pause ALL alarms? Use only when the patient is disconnected on purpose.')) return;
+  wsSend(standby ? 'S:0' : 'S:1');
+}
+
+// Connection loss is itself an alarm: a silent dashboard must never look "fine".
+setInterval(() => {
+  const lost = Date.now() - lastMsgMs > 3000;
+  if (lost !== connLost) { connLost = lost; renderAlarms(); }
+}, 1000);
+
+/* ================= ALARM SOUND (Web Audio) ================= */
+// Browsers only allow sound after a click, hence the "Enable alarm sound" button.
+let audioCtx = null;
+let lastPatternMs = 0;
+function enableSound() {
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    audioCtx.resume();
+    beep(660, 0, 0.12);
+  } catch (e) { audioCtx = null; alert('This browser cannot play alarm sounds.'); }
+  renderAlarms();
+}
+function beep(freq, offset, dur) {
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.type = 'square'; o.frequency.value = freq; g.gain.value = 0.15;
+  o.connect(g); g.connect(audioCtx.destination);
+  const t = audioCtx.currentTime + offset;
+  o.start(t); o.stop(t + dur);
+}
+const PATTERNS = { 3: { n: 3, f: 880, every: 2500 }, 2: { n: 2, f: 660, every: 5000 }, 1: { n: 1, f: 440, every: 15000 } };
+setInterval(() => {
+  if (!audioCtx) return;
+  let prio = 0;
+  for (const a of alarms) if (!a.silenced && a.prio > prio) prio = a.prio;
+  if (connLost && prio < 2) prio = 2;
+  if (!prio) return;
+  const p = PATTERNS[prio], now = Date.now();
+  if (now - lastPatternMs < p.every) return;
+  lastPatternMs = now;
+  for (let i = 0; i < p.n; i++) beep(p.f, i * 0.25, 0.15);
+}, 250);
+
+/* ================= PATIENT RECORD (stored on the monitor) ================= */
+let patient = {};
+
+async function fetchPatient() {
+  try {
+    const r = await fetch('/api/patient', { cache: 'no-store' });
+    if (r.ok) patient = await r.json();
+  } catch (e) {}
+  loadPatient();
+}
+
+function loadPatient() {
+  const p = patient;
+  const set = (id, val, fallback = '--') => {
+    const el = document.getElementById(id);
+    if (val && val !== '') { el.textContent = val; el.classList.remove('empty'); }
+    else { el.textContent = fallback; el.classList.add('empty'); }
+  };
+  set('viewAge', p.age);
+  set('viewGender', p.gender);
+  set('viewBlood', p.blood);
+  set('viewPhone', p.phone);
+  set('viewId', p.id);
+  set('viewBed', p.bed ? (p.bed + (p.ward ? ' / ' + p.ward : '')) : '');
+  set('viewNotes', p.notes, 'No notes added.');
+
+  document.getElementById('recName').textContent   = p.name || 'No patient saved';
+  document.getElementById('recAvatar').textContent = p.name ? p.name.charAt(0).toUpperCase() : '?';
+  document.getElementById('recIdTag').textContent   = p.id   ? 'ID: ' + p.id     : 'No ID';
+  document.getElementById('recBedTag').textContent  = p.bed  ? 'Bed: ' + p.bed   : 'Bed: --';
+  document.getElementById('recWardTag').textContent = p.ward ? 'Ward: ' + p.ward : 'Ward: --';
+
+  document.getElementById('inName').value   = p.name   || '';
+  document.getElementById('inAge').value    = p.age    || '';
+  document.getElementById('inGender').value = p.gender || '';
+  document.getElementById('inBlood').value  = p.blood  || '';
+  document.getElementById('inPhone').value  = p.phone  || '';
+  document.getElementById('inId').value     = p.id     || '';
+  document.getElementById('inBed').value    = p.bed    || '';
+  document.getElementById('inWard').value   = p.ward   || '';
+  document.getElementById('inNotes').value  = p.notes  || '';
+
+  const nameEl = document.getElementById('bannerPatientName');
+  const metaEl = document.getElementById('bannerPatientMeta');
+  nameEl.textContent = p.name ? ('👤 ' + p.name) : '👤 No patient saved';
+  const meta = [];
+  if (p.age)    meta.push(p.age + ' yrs');
+  if (p.gender) meta.push(p.gender);
+  if (p.id)     meta.push('ID: ' + p.id);
+  metaEl.textContent = meta.join(' • ');
+  metaEl.style.display = meta.length ? 'block' : 'none';
+}
+
+function toggleEdit() { document.getElementById('editPanel').classList.toggle('show'); }
+function cancelEdit() { document.getElementById('editPanel').classList.remove('show'); loadPatient(); }
+async function savePatient() {
+  const v = id => document.getElementById(id).value.trim();
+  const body = new URLSearchParams({
+    name: v('inName'), age: v('inAge'), gender: v('inGender'), blood: v('inBlood'),
+    phone: v('inPhone'), id: v('inId'), bed: v('inBed'), ward: v('inWard'), notes: v('inNotes'),
+  });
+  try {
+    const r = await fetch('/api/patient', { method: 'POST', body });
+    if (!r.ok) { alert('❌ Save failed: ' + await r.text()); return; }
+    patient = await r.json();
+  } catch (e) { alert('❌ Save failed: monitor not reachable'); return; }
+  document.getElementById('editPanel').classList.remove('show');
+  loadPatient();
+  alert('✅ Patient record saved on the monitor');
+}
+
+/* ================= DATA LOGGING (recorded on the monitor) ================= */
+let logInfo = { running: false, rows: 0 };
+
+function fmtDuration(s) {
+  s = Math.max(0, s | 0);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
+  return (h ? h + 'h ' : '') + (h || m ? m + 'm ' : '') + x + 's';
+}
+function fmtBytes(b) { return b >= 1048576 ? (b / 1048576).toFixed(2) + ' MB' : (b / 1024).toFixed(1) + ' KB'; }
+
+async function logRefresh() {
+  try {
+    const r = await fetch('/api/log/status', { cache: 'no-store' });
+    if (!r.ok) return;
+    logInfo = await r.json();
+  } catch (e) { return; }
+  renderLog();
+}
+
+function renderLog() {
+  const s = logInfo;
+  document.getElementById('recPill').classList.toggle('show', !!s.running);
+  if (currentPage !== 'logging') return;
+
+  const st = document.getElementById('logState');
+  st.textContent = s.running ? '● RECORDING — every ' + s.interval + ' s' : '● STOPPED';
+  st.classList.toggle('rec', !!s.running);
+  document.getElementById('logStarted').textContent  = s.started || '--';
+  document.getElementById('logDuration').textContent = s.rows ? fmtDuration(s.elapsed) : '--';
+  document.getElementById('logRows').textContent     = s.rows || 0;
+  const pct = s.max ? Math.min(100, s.bytes * 100 / s.max) : 0;
+  document.getElementById('logStorage').textContent  = s.bytes ? fmtBytes(s.bytes) + ' (' + pct.toFixed(0) + '%)' : '--';
+  const fill = document.getElementById('logBarFill');
+  fill.style.width = pct + '%';
+  fill.classList.toggle('high', pct > 80);
+
+  let msg = '';
+  if (s.fs === false) msg = '⚠ No flash filesystem on the monitor — choose a partition scheme with SPIFFS when flashing.';
+  else if (!s.running && s.reason && s.reason !== 'stopped by user') msg = '⚠ Recording stopped: ' + s.reason;
+  else if (s.running && pct > 80) msg = '⚠ Storage almost full — recording stops automatically at 100 %.';
+  document.getElementById('logMsg').textContent = msg;
+
+  document.getElementById('logStartBtn').disabled = !!s.running || s.fs === false;
+  document.getElementById('logStopBtn').disabled  = !s.running;
+  document.getElementById('logDlBtn').disabled    = !s.rows;
+  document.getElementById('logInterval').disabled = !!s.running;
+  if (s.running) document.getElementById('logInterval').value = String(s.interval);
+
+  const body = document.getElementById('logRowsBody');
+  body.textContent = '';
+  const rows = s.recent || [];
+  if (!rows.length) {
+    const tr = document.createElement('tr'), td = document.createElement('td');
+    td.colSpan = 10; td.className = 'log-empty';
+    td.textContent = s.rows ? 'Previous log stored on the monitor (' + s.rows + ' rows) — download it or start a new one'
+                            : 'No data yet — press Start';
+    tr.appendChild(td); body.appendChild(tr);
+    return;
+  }
+  // CSV columns: timestamp,elapsed_s,hr,pulse,ecg_hr,spo2,skin,room,rh,leads,alarms
+  for (const line of rows) {
+    const c = line.split(',');
+    const cells = [c[0], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], (c[10] || '').split('|').join(', ')];
+    const tr = document.createElement('tr');
+    cells.forEach((v, i) => {
+      const td = document.createElement('td');
+      td.textContent = (v === undefined || v === '') ? '--' : v;
+      if (i === 9 && v) td.className = 'alarm';
+      tr.appendChild(td);
+    });
+    body.appendChild(tr);
+  }
+}
+
+async function logStart() {
+  if (logInfo.rows > 0 && !confirm('Start a new recording?\n\nThe previous log (' + logInfo.rows +
+      ' rows) will be replaced. Download it first if you need it.')) return;
+  const body = new URLSearchParams({
+    interval: document.getElementById('logInterval').value,
+    epoch: Date.now(),                              // the monitor has no clock: use this device's
+    tz: -new Date().getTimezoneOffset(),            // minutes east of UTC (IST = 330)
+  });
+  try {
+    const r = await fetch('/api/log/start', { method: 'POST', body });
+    if (!r.ok) { alert('❌ Could not start: ' + await r.text()); return; }
+  } catch (e) { alert('❌ Monitor not reachable'); return; }
+  logRefresh();
+}
+
+async function logStop() {
+  try {
+    const r = await fetch('/api/log/stop', { method: 'POST' });
+    if (!r.ok) { alert('❌ Could not stop: ' + await r.text()); return; }
+  } catch (e) { alert('❌ Monitor not reachable'); return; }
+  logRefresh();
+}
+
+function logDownload() {
+  const a = document.createElement('a');
+  a.href = '/api/log.csv?t=' + Date.now();          // filename comes from the monitor
+  a.download = '';
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+// Poll every 2 s on the logging page, every 10 s elsewhere (keeps the REC badge right)
+let logTick = 0;
+setInterval(() => {
+  logTick++;
+  if (currentPage === 'logging' || logTick % 5 === 0) logRefresh();
+}, 2000);
+
+/* ================= INIT ================= */
+fetchPatient();
+logRefresh();
+connectWS();
+updateLeadPill();
+renderAlarms();
+draw();
+</script>
+</body>
+</html>
+)rawliteral";
+
+// =====================================================================
+//  WEBSOCKET CLIENT MANAGEMENT (token auth, slow-client protection)
+// =====================================================================
+static uint8_t wsAuthedCount() {
+  uint8_t n = 0;
+  for (uint8_t i = 0; i < WEBSOCKETS_SERVER_CLIENT_MAX; i++) n += g_wsAuthed[i] ? 1 : 0;
+  return n;
+}
+
+// Sends to every authenticated client. A client whose send fails or blocks
+// longer than WS_SLOW_CLIENT_MS is disconnected so it can't stall the monitor.
+static void wsSendAll(String& msg) {
+  for (uint8_t n = 0; n < WEBSOCKETS_SERVER_CLIENT_MAX; n++) {
+    if (!g_wsAuthed[n]) continue;
+    const uint32_t t0 = millis();
+    const bool ok = webSocket.sendTXT(n, msg);
+    const uint32_t dt = millis() - t0;
+    if (!ok || dt > WS_SLOW_CLIENT_MS) {
+      g_slowClientDrops++;
+      g_wsAuthed[n] = false;
+      g_wsKick[n] = true;
+      Serial.printf("[WS] Client %u dropped (%s, %lu ms)\n", n, ok ? "too slow" : "send failed", (unsigned long)dt);
+    }
+  }
+}
+
+// "L:<off>:<reason bits>"
+static void buildLeadMsg(bool off, uint8_t reason) {
+  g_lMsg = off ? "L:1:" : "L:0:";
+  g_lMsg += (int)reason;
+}
+
+static void buildAlarmMsg(uint32_t now);
+static void sendInitialState(uint8_t num) {
+  buildLeadMsg(s_leadOff, s_leadReason);
+  webSocket.sendTXT(num, g_lMsg);
+  buildAlarmMsg(millis());
+  webSocket.sendTXT(num, g_aMsg);
+  if (g_vMsg.length()) webSocket.sendTXT(num, g_vMsg);
+}
+
+static void alarmAck(int id, uint32_t now);
+static void setStandby(bool on);
+
+static void handleWsText(uint8_t num, const uint8_t* payload, size_t length) {
+  char buf[48];
+  const size_t n = length < sizeof(buf) - 1 ? length : sizeof(buf) - 1;
+  memcpy(buf, payload, n);
+  buf[n] = 0;
+
+  if (buf[0] == 'T' && buf[1] == ':') {
+    if (strcmp(buf + 2, g_wsToken) == 0) {
+      g_wsAuthed[num] = true;
+      g_wsPending[num] = false;
+      Serial.printf("[WS] Client %u authenticated\n", num);
+      sendInitialState(num);
+    } else {
+      Serial.printf("[WS] Client %u bad token\n", num);
+      g_wsKick[num] = true;
+    }
+    return;
+  }
+  if (!g_wsAuthed[num]) return;                 // ignore everything else until authed
+
+  if (buf[0] == 'K' && buf[1] == ':') {
+    alarmAck(atoi(buf + 2), millis());
+  } else if (strcmp(buf, "S:1") == 0) {
+    setStandby(true);
+  } else if (strcmp(buf, "S:0") == 0) {
+    setStandby(false);
+  }
+}
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+  if (num >= WEBSOCKETS_SERVER_CLIENT_MAX) return;
+  switch (type) {
+    case WStype_CONNECTED:
+      g_wsAuthed[num] = false;
+      g_wsPending[num] = true;
+      g_wsKick[num] = false;
+      g_wsConnMs[num] = millis();
+      Serial.printf("[WS] Client %u connected (awaiting token)\n", num);
+      break;
+    case WStype_DISCONNECTED:
+      g_wsAuthed[num] = false;
+      g_wsPending[num] = false;
+      g_wsKick[num] = false;
+      Serial.printf("[WS] Client %u disconnected\n", num);
+      break;
+    case WStype_TEXT:
+      handleWsText(num, payload, length);
+      break;
+    default:
+      break;
+  }
+}
+
+static void wsHousekeeping(uint32_t now) {
+  for (uint8_t n = 0; n < WEBSOCKETS_SERVER_CLIENT_MAX; n++) {
+    if (g_wsPending[n] && now - g_wsConnMs[n] > WS_AUTH_TIMEOUT_MS) {
+      Serial.printf("[WS] Client %u: no token in time\n", n);
+      g_wsKick[n] = true;
+    }
+    if (g_wsKick[n]) {
+      g_wsKick[n] = false;
+      g_wsAuthed[n] = false;
+      g_wsPending[n] = false;
+      webSocket.disconnect(n);
+    }
+  }
+}
+
+// =====================================================================
+//  HTTP (Basic auth) + PATIENT RECORD IN NVS
+// =====================================================================
+static bool requireAuth() {
+  if (server.authenticate(DASH_USER, DASH_PASS)) return true;
+  server.requestAuthentication(BASIC_AUTH, "MedMonitor");
+  return false;
+}
+
+void handleRoot() {
+  if (!requireAuth()) return;
+  server.sendHeader("Cache-Control", "no-store");
+  server.send_P(200, "text/html", index_html);
+}
+
+void handleToken() {
+  if (!requireAuth()) return;
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/plain", g_wsToken);
+}
+
+static void jsonEscape(String& out, const String& val);
+static void jsonField(String& out, const char* key, const String& val, bool comma) {
+  if (comma) out += ',';
+  out += '"'; out += key; out += "\":";
+  jsonEscape(out, val);
+}
+
+// Appends val as a quoted, escaped JSON string.
+static void jsonEscape(String& out, const String& val) {
+  out += '"';
+  for (size_t i = 0; i < val.length(); i++) {
+    const char c = val[i];
+    switch (c) {
+      case '"':  out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n";  break;
+      case '\r': out += "\\r";  break;
+      case '\t': out += "\\t";  break;
+      default:
+        if ((uint8_t)c < 0x20) { char e[8]; snprintf(e, sizeof e, "\\u%04x", (unsigned)(uint8_t)c); out += e; }
+        else out += c;
+    }
+  }
+  out += '"';
+}
+
+// Strip control characters (except newline in notes), cap length without
+// cutting a UTF-8 character in half, trim spaces.
+static String cleanField(const String& in, size_t maxLen, bool allowNewline) {
+  String out;
+  out.reserve(maxLen + 1);
+  for (size_t i = 0; i < in.length() && out.length() < maxLen; i++) {
+    const char c = in[i];
+    if ((uint8_t)c < 0x20 && !(allowNewline && c == '\n')) continue;
+    out += c;
+  }
+  if (in.length() > maxLen) {
+    while (out.length() && (((uint8_t)out[out.length() - 1]) & 0xC0) == 0x80) out.remove(out.length() - 1);
+    if (out.length() && (((uint8_t)out[out.length() - 1]) & 0xC0) == 0xC0) out.remove(out.length() - 1);
+  }
+  out.trim();
+  return out;
+}
+
+static bool oneOf(const String& v, const char* const* opts, size_t n) {
+  for (size_t i = 0; i < n; i++) if (v == opts[i]) return true;
+  return false;
+}
+
+static String patientJson() {
+  String j = "{";
+  jsonField(j, "name",   prefs.getString("name", ""),   false);
+  jsonField(j, "age",    prefs.getString("age", ""),    true);
+  jsonField(j, "gender", prefs.getString("gender", ""), true);
+  jsonField(j, "blood",  prefs.getString("blood", ""),  true);
+  jsonField(j, "phone",  prefs.getString("phone", ""),  true);
+  jsonField(j, "id",     prefs.getString("pid", ""),    true);
+  jsonField(j, "bed",    prefs.getString("bed", ""),    true);
+  jsonField(j, "ward",   prefs.getString("ward", ""),   true);
+  jsonField(j, "notes",  prefs.getString("notes", ""),  true);
+  j += '}';
+  return j;
+}
+
+void handlePatientGet() {
+  if (!requireAuth()) return;
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", patientJson());
+}
+
+void handlePatientPost() {
+  if (!requireAuth()) return;
+  static const char* const GENDERS[] = {"", "Male", "Female", "Other"};
+  static const char* const BLOODS[]  = {"", "A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"};
+
+  String age = cleanField(server.arg("age"), 3, false);
+  if (age.length()) {
+    const long a = age.toInt();
+    if (a < 0 || a > 120 || String(a) != age) { server.send(400, "text/plain", "Age must be 0-120"); return; }
+  }
+  const String gender = cleanField(server.arg("gender"), 8, false);
+  const String blood  = cleanField(server.arg("blood"), 3, false);
+  if (!oneOf(gender, GENDERS, 4)) { server.send(400, "text/plain", "Invalid gender"); return; }
+  if (!oneOf(blood, BLOODS, 9))   { server.send(400, "text/plain", "Invalid blood group"); return; }
+
+  prefs.putString("name",   cleanField(server.arg("name"), 48, false));
+  prefs.putString("age",    age);
+  prefs.putString("gender", gender);
+  prefs.putString("blood",  blood);
+  prefs.putString("phone",  cleanField(server.arg("phone"), 20, false));
+  prefs.putString("pid",    cleanField(server.arg("id"), 24, false));
+  prefs.putString("bed",    cleanField(server.arg("bed"), 12, false));
+  prefs.putString("ward",   cleanField(server.arg("ward"), 24, false));
+  prefs.putString("notes",  cleanField(server.arg("notes"), 300, true));
+  Serial.println(F("[REC] Patient record saved to NVS"));
+  server.send(200, "application/json", patientJson());
+}
+
+void handleNotFound() { server.send(404, "text/plain", "Not found"); }
+
+// =====================================================================
+//  DATA LOGGING — CSV on the ESP32's flash (LittleFS)
+//  Runs on the monitor, so recording continues when the browser closes.
+//  Rows are buffered in RAM and written in blocks of LOG_FLUSH_ROWS to
+//  keep flash writes (which briefly pause both CPU cores) infrequent.
+// =====================================================================
+struct LogState {
+  bool     fsOk = false, running = false;
+  uint16_t intervalS = 1;
+  uint32_t rows = 0, bytes = 0, durationS = 0;
+  uint32_t startMs = 0, nextRowMs = 0;
+  int64_t  baseEpochMs = 0;      // browser clock at Start (no RTC on board)
+  int32_t  tzOffsetMin = 330;    // minutes east of UTC (IST = +330)
+  String   buf;                  // rows not yet written to flash
+  uint8_t  bufRows = 0;
+  String   startedAt, reason;
+} g_log;
+String  g_logRecent[LOG_RECENT_N];
+uint8_t g_logRecentIdx = 0, g_logRecentN = 0;
+
+static const char* const LOG_HEADER =
+  "timestamp,elapsed_s,heart_rate_bpm,pulse_ox_hr_bpm,ecg_hr_bpm,spo2_pct,"
+  "skin_temp_c,room_temp_c,humidity_pct,ecg_leads,alarms\r\n";
+
+static void logSaveMeta() {
+  prefsLog.putString("started", g_log.startedAt);
+  prefsLog.putUShort("interval", g_log.intervalS);
+  prefsLog.putBool("running", g_log.running);
+  prefsLog.putString("reason", g_log.reason);
+  prefsLog.putULong("duration", g_log.durationS);
+}
+
+static void logTimestamp(uint32_t nowMs, char* out, size_t n) {
+  const int64_t epochMs = g_log.baseEpochMs + (int64_t)(uint32_t)(nowMs - g_log.startMs);
+  time_t local = (time_t)(epochMs / 1000) + (time_t)g_log.tzOffsetMin * 60;
+  struct tm tmv;
+  gmtime_r(&local, &tmv);
+  strftime(out, n, "%Y-%m-%d %H:%M:%S", &tmv);
+}
+
+static void logStop(const char* why);
+
+static void logFlush() {
+  if (!g_log.buf.length()) return;
+  File f = LittleFS.open(LOG_PATH, FILE_APPEND);
+  if (!f) { g_log.buf = ""; g_log.bufRows = 0; logStop("flash write error"); return; }
+  const size_t n = f.print(g_log.buf);
+  f.close();
+  g_log.bytes += n;
+  g_log.buf = "";
+  g_log.bufRows = 0;
+  if (g_log.bytes >= LOG_MAX_BYTES) logStop("storage full — download, then start a new log");
+}
+
+static void logStop(const char* why) {
+  if (!g_log.running) return;
+  g_log.running = false;                 // set first: logFlush() may call back here
+  logFlush();
+  g_log.durationS = (millis() - g_log.startMs) / 1000;
+  g_log.reason = why;
+  logSaveMeta();
+  Serial.printf("[LOG] Stopped: %s (%lu rows, %lu bytes)\n", why,
+                (unsigned long)g_log.rows, (unsigned long)g_log.bytes);
+}
+
+static void csvInt(String& s, int v)     { s += ','; if (v > 0) s += v; }
+static void csvF1(String& s, float v)    { s += ','; if (v > 0) s += String(v, 1); }
+
+static void logWriteRow(uint32_t now) {
+  char ts[24];
+  logTimestamp(now, ts, sizeof ts);
+  String line;
+  line.reserve(128);
+  line += ts;
+  line += ',';
+  line += (unsigned long)((now - g_log.startMs) / 1000);
+  csvInt(line, g_hr);
+  csvInt(line, g_pulse);
+  csvInt(line, g_ecgHr);
+  csvInt(line, g_spo2);
+  csvF1(line, g_temperature);
+  csvF1(line, g_roomTemp);
+  csvF1(line, g_humidity);
+  line += ',';
+  line += s_leadOff ? "off" : "on";
+  line += ',';
+  bool first = true;
+  if (g_standby) { line += "STANDBY"; first = false; }
+  for (uint8_t i = 0; i < AL_COUNT; i++) {
+    if (!g_al[i].active) continue;
+    if (!first) line += '|';             // '|' keeps the CSV to one column
+    line += ALARM_DEFS[i].name;
+    first = false;
+  }
+
+  g_logRecent[g_logRecentIdx] = line;
+  g_logRecentIdx = (uint8_t)((g_logRecentIdx + 1) % LOG_RECENT_N);
+  if (g_logRecentN < LOG_RECENT_N) g_logRecentN++;
+
+  g_log.buf += line;
+  g_log.buf += "\r\n";
+  g_log.bufRows++;
+  g_log.rows++;
+  if (g_log.bufRows >= LOG_FLUSH_ROWS || g_log.intervalS >= 10) logFlush();
+}
+
+static void logService(uint32_t now) {
+  if (!g_log.running) return;
+  if ((int32_t)(now - g_log.nextRowMs) < 0) return;
+  logWriteRow(now);
+  const uint32_t iv = (uint32_t)g_log.intervalS * 1000UL;
+  g_log.nextRowMs += iv;
+  if ((int32_t)(now - g_log.nextRowMs) > (int32_t)iv) g_log.nextRowMs = now + iv;  // fell behind: resync
+}
+
+// Count rows of a log left over from before a reboot.
+static void logRestoreAtBoot() {
+  if (!g_log.fsOk || !LittleFS.exists(LOG_PATH)) return;
+  File f = LittleFS.open(LOG_PATH, "r");
+  if (!f) return;
+  g_log.bytes = f.size();
+  uint32_t lines = 0;
+  uint8_t chunk[256];
+  while (f.available()) {
+    const int n = f.read(chunk, sizeof chunk);
+    if (n <= 0) break;
+    for (int i = 0; i < n; i++) if (chunk[i] == '\n') lines++;
+    esp_task_wdt_reset();
+  }
+  f.close();
+  g_log.rows      = lines > 0 ? lines - 1 : 0;   // minus header
+  g_log.startedAt = prefsLog.getString("started", "");
+  g_log.intervalS = prefsLog.getUShort("interval", 1);
+  g_log.durationS = prefsLog.getULong("duration", 0);
+  g_log.reason    = prefsLog.getString("reason", "");
+  if (prefsLog.getBool("running", false)) {
+    g_log.reason = "device restarted while recording";
+    g_log.durationS = g_log.rows * g_log.intervalS;
+    prefsLog.putBool("running", false);
+    prefsLog.putString("reason", g_log.reason);
+    prefsLog.putULong("duration", g_log.durationS);
+  }
+  Serial.printf("[LOG] Previous log on flash: %lu rows, %lu bytes\n",
+                (unsigned long)g_log.rows, (unsigned long)g_log.bytes);
+}
+
+void handleLogStart() {
+  if (!requireAuth()) return;
+  if (!g_log.fsOk) { server.send(500, "text/plain", "No flash filesystem — select a partition scheme with SPIFFS/LittleFS"); return; }
+  if (g_log.running) { server.send(409, "text/plain", "Already recording"); return; }
+
+  const uint16_t iv = (uint16_t)server.arg("interval").toInt();
+  bool ivOk = false;
+  for (size_t i = 0; i < sizeof(LOG_INTERVALS) / sizeof(LOG_INTERVALS[0]); i++) if (iv == LOG_INTERVALS[i]) ivOk = true;
+  if (!ivOk) { server.send(400, "text/plain", "Invalid interval"); return; }
+  const long long epoch = strtoll(server.arg("epoch").c_str(), nullptr, 10);
+  if (epoch < 1600000000000LL || epoch > 4100000000000LL) { server.send(400, "text/plain", "Invalid clock from browser"); return; }
+  long tz = server.arg("tz").toInt();
+  if (tz < -720 || tz > 840) tz = 330;
+
+  File f = LittleFS.open(LOG_PATH, FILE_WRITE);          // replaces the previous log
+  if (!f) { server.send(500, "text/plain", "Cannot create log file"); return; }
+  const size_t n = f.print(LOG_HEADER);
+  f.close();
+
+  const uint32_t now = millis();
+  g_log.intervalS   = iv;
+  g_log.baseEpochMs = epoch;
+  g_log.tzOffsetMin = (int32_t)tz;
+  g_log.startMs     = now;
+  g_log.nextRowMs   = now;                                // first row immediately
+  g_log.rows = 0; g_log.bytes = n; g_log.durationS = 0;
+  g_log.buf = ""; g_log.bufRows = 0;
+  g_log.reason = "";
+  g_logRecentN = g_logRecentIdx = 0;
+  char ts[24];
+  logTimestamp(now, ts, sizeof ts);
+  g_log.startedAt = ts;
+  g_log.running = true;
+  logSaveMeta();
+  Serial.printf("[LOG] Started at %s, every %u s\n", ts, iv);
+  server.send(200, "text/plain", "OK");
+}
+
+void handleLogStop() {
+  if (!requireAuth()) return;
+  logStop("stopped by user");
+  server.send(200, "text/plain", "OK");
+}
+
+void handleLogStatus() {
+  if (!requireAuth()) return;
+  const uint32_t elapsed = g_log.running ? (millis() - g_log.startMs) / 1000 : g_log.durationS;
+  String j = "{";
+  j += "\"fs\":";       j += g_log.fsOk ? "true" : "false";
+  j += ",\"running\":"; j += g_log.running ? "true" : "false";
+  j += ",\"interval\":"; j += g_log.intervalS;
+  j += ",\"rows\":";    j += (unsigned long)g_log.rows;
+  j += ",\"bytes\":";   j += (unsigned long)(g_log.bytes + g_log.buf.length());
+  j += ",\"max\":";     j += (unsigned long)LOG_MAX_BYTES;
+  j += ",\"elapsed\":"; j += (unsigned long)elapsed;
+  jsonField(j, "started", g_log.startedAt, true);
+  jsonField(j, "reason", g_log.reason, true);
+  j += ",\"recent\":[";
+  for (uint8_t k = 0; k < g_logRecentN; k++) {            // newest first
+    const uint8_t idx = (uint8_t)((g_logRecentIdx + LOG_RECENT_N - 1 - k) % LOG_RECENT_N);
+    if (k) j += ',';
+    jsonEscape(j, g_logRecent[idx]);
+  }
+  j += "]}";
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", j);
+}
+
+void handleLogDownload() {
+  if (!requireAuth()) return;
+  if (g_log.running) logFlush();                          // include the newest rows
+  if (!g_log.fsOk || !LittleFS.exists(LOG_PATH)) { server.send(404, "text/plain", "No log recorded yet"); return; }
+  File f = LittleFS.open(LOG_PATH, "r");
+  if (!f) { server.send(500, "text/plain", "Cannot open log"); return; }
+
+  // medmonitor_<patientId>_<YYYYMMDD_HHMMSS>.csv
+  String pid = prefs.getString("pid", ""), safe, stamp;
+  for (size_t i = 0; i < pid.length() && safe.length() < 24; i++) {
+    const char c = pid[i];
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_') safe += c;
+  }
+  for (size_t i = 0; i < g_log.startedAt.length(); i++) {
+    const char c = g_log.startedAt[i];
+    if (c >= '0' && c <= '9') stamp += c;
+    else if (c == ' ') stamp += '_';
+  }
+  String name = "medmonitor";
+  if (safe.length())  { name += '_'; name += safe; }
+  if (stamp.length()) { name += '_'; name += stamp; }
+  name += ".csv";
+
+  server.sendHeader("Content-Disposition", "attachment; filename=\"" + name + "\"");
+  server.sendHeader("Cache-Control", "no-store");
+  server.streamFile(f, "text/csv");
+  f.close();
+}
+
+// =====================================================================
+//  WIFI (NON-BLOCKING)
+// =====================================================================
+unsigned long lastWifiAttempt = 0;
+bool g_wifiConnected = false;
+const unsigned long WIFI_RETRY_MS = 10000;
+
+static void startWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(ssid, password);
+  lastWifiAttempt = millis();
+  Serial.printf("[WIFI] Connecting to \"%s\"...\n", ssid);
+}
+
+static void serviceWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!g_wifiConnected) {
+      g_wifiConnected = true;
+      Serial.printf("[WIFI] Connected! Dashboard: http://%s  (user: %s)\n",
+                    WiFi.localIP().toString().c_str(), DASH_USER);
+    }
+    return;
+  }
+  if (g_wifiConnected) {
+    g_wifiConnected = false;
+    Serial.println(F("[WIFI] Lost connection — monitoring and alarms continue, retrying..."));
+  }
+  if (millis() - lastWifiAttempt >= WIFI_RETRY_MS) {
+    Serial.println(F("[WIFI] Retrying..."));
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+    lastWifiAttempt = millis();
+  }
+}
+
+// =====================================================================
+//  PULSE OXIMETER (I2C owned by the sensor task after setup)
+// =====================================================================
+static bool i2cPresent(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission() == 0;
+}
+
+static void i2cScanReport() {
+  Serial.println(F("[I2C] Scanning bus (SDA=21, SCL=22)..."));
+  bool found = false;
+  for (uint8_t a = 1; a < 127; a++) {
+    if (i2cPresent(a)) { Serial.printf("[I2C]   device at 0x%02X\n", a); found = true; }
+  }
+  if (!found) {
+    Serial.println(F("[I2C]   NOTHING found on the bus!"));
+    Serial.println(F("[I2C]   Check pulse sensor: VIN->3.3V, GND->GND, SDA->GPIO21, SCL->GPIO22"));
+    Serial.println(F("[I2C]   Purple GY-MAX30100 board? Its pull-ups go to 1.8 V — fit 4.7k to 3.3 V."));
+  }
+}
+
+// ==== PULSE OXIMETER MODULE BEGIN ====
+// Library-free MAX30100 / MAX30102 driver + PPG signal processing (v3.4).
+// Runs entirely inside the sensor task (single I2C owner). Pipeline:
+//   FIFO @100 Hz -> DC tracking + 4 Hz low-pass per LED -> 50 Hz ring (8 s)
+//   -> automatic LED current (DC kept at 25–80 % of full scale)
+//   -> finger detection (IR DC level, with hysteresis)
+//   -> heart rate = normalised autocorrelation peak (robust to missed /
+//      extra beats, unlike beat-to-beat detectors)
+//   -> SpO2 = A - B * R,  R = (ACred/DCred) / (ACir/DCir)  (uncalibrated)
+//   -> quality gate: correlation >= 0.5 and perfusion index 0.05–20 %.
+
+enum : uint8_t { PO_CHIP_NONE = 0, PO_CHIP_30100 = 1, PO_CHIP_30102 = 2 };
+enum : uint8_t { PO_MISSING = 0, PO_NOFINGER = 1, PO_ADJUSTING = 2, PO_WEAK = 3, PO_GOOD = 4 };
+
+#define PO_ADDR          0x57
+#define PO_WIN           400      // 8 s analysis window at 50 Hz
+#define PO_AFS_HZ        50.0f    // analysis rate (100 Hz sensor / 2)
+#define PO_MIN_FILL      250      // 5 s of clean signal before the first rate
+#define PO_LAG_MIN       15       // 200 bpm
+#define PO_LAG_MAX       86       // 35 bpm
+#define PO_Q_GOOD        0.60f    // autocorrelation peak needed to trust the rate (real pulses: 0.9+)
+#define PO_Q_RELEARN     0.80f    // stricter bar for re-learning the motion reference
+#define PO_SUBHARM       0.85f    // pick the shortest lag within 85 % of the best peak
+#define PO_PI_MIN        0.05f    // perfusion index window (%)
+#define PO_PI_MAX        20.0f
+#define PO_DC_TARGET     0.50f    // LED control: aim for 50 % of full scale
+#define PO_DC_LOW        0.25f
+#define PO_DC_HIGH       0.80f
+#define PO_DC_SAT        0.95f
+#define PO_DC_ALPHA      0.0165f  // DC tracker, tau = 0.6 s at 100 Hz
+#define PO_MIN_MA        1.0f
+#define PO_MAX_MA        50.0f
+#define PO_AGC_MS        500
+#define PO_SETTLE_MS     1000     // ignore samples this long after any LED change
+#define PO_ANALYSE_MS    1000
+#define PO_RETRY_MS      5000
+#define PO_I2C_FAIL_MAX  3
+#define PO_BLOCK         50       // 1 s blocks for motion detection
+#define PO_MOTION_X      3.0f     // block energy > 3x the good-signal level = motion
+#define PO_RELEARN_MS    10000    // "motion" this long -> try re-learning from a strongly periodic signal
+#define PO_JUMP_FRAC     0.25f    // rate jumps > 25 % must repeat ...
+#define PO_JUMP_CONFIRM  3        // ... in 3 consecutive analyses (3 s) before being shown
+#ifndef PO_FINGER_ON
+#define PO_FINGER_ON     0.15f    // IR DC (fraction of full scale) = finger placed
+#endif
+#ifndef PO_FINGER_OFF
+#define PO_FINGER_OFF    0.08f    // IR DC below this = finger removed
+#endif
+#ifndef PO_DETECT_MA
+#define PO_DETECT_MA     24.0f    // LED current while waiting for a finger
+#endif
+#ifndef SPO2_CAL_A
+#define SPO2_CAL_A       110.0f   // SpO2 = A - B * R (generic, uncalibrated)
+#endif
+#ifndef SPO2_CAL_B
+#define SPO2_CAL_B       25.0f
+#endif
+
+// Published to loop() (single writer: sensor task)
+volatile uint8_t  s_poChip    = PO_CHIP_NONE;
+volatile uint8_t  s_poState   = PO_MISSING;
+volatile uint8_t  s_poQuality = 0;     // autocorrelation peak x 100
+volatile float    s_poHr      = 0;     // bpm, 0 = not valid
+volatile float    s_poSpo2    = 0;     // %,   0 = not valid
+volatile float    s_poPi      = 0;     // perfusion index %
+volatile float    s_poR       = 0;     // ratio of ratios
+volatile float    s_poIrMa    = 0, s_poRedMa = 0;
+volatile float    s_poIrDc    = 0, s_poRedDc = 0;   // fraction of full scale
+
+static const float PO_30100_MA[16] = { 0.0f, 4.4f, 7.6f, 11.0f, 14.2f, 17.4f, 20.8f, 24.0f,
+                                       27.1f, 30.6f, 33.8f, 37.0f, 40.2f, 43.6f, 46.8f, 50.0f };
+
+struct PoState {
+  uint8_t  chip;
+  float    fullScale;
+  float    irMa, redMa;
+  bool     finger;
+  uint32_t settleUntil, lastAgcMs, lastAnalyseMs, lastRetryMs;
+  uint8_t  i2cFails;
+  bool     dcInit;
+  float    dcIr, dcRed;
+  Biquad   lpIr, lpRed;
+  uint8_t  decim;
+  float    agcSumIr, agcSumRed, agcMaxIr, agcMaxRed;
+  uint16_t agcN;
+  float    acIr[PO_WIN], acRed[PO_WIN], dcIrR[PO_WIN], dcRedR[PO_WIN];
+  uint16_t idx, fill;
+  float    env, v1, v2, periodMs;
+  uint32_t lastBeatMs;
+  float    refRms;                // AC level of the last good window (motion reference)
+  uint32_t motionSinceMs;
+  float    lastHr, candHr;        // jump guard
+  uint32_t lastHrMs;
+  uint8_t  candCount;
+  bool     missingLogged;
+};
+static PoState po;
+static float   po_x[PO_WIN];
+static float   po_cum[PO_WIN + 1];
+static float   po_r[PO_LAG_MAX + 2];
+
+static bool poWriteReg(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(PO_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission() == 0;
+}
+
+static bool poReadRegs(uint8_t reg, uint8_t* buf, uint8_t n) {
+  Wire.beginTransmission(PO_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint8_t)PO_ADDR, n) != n) {
+    while (Wire.available()) Wire.read();
+    return false;
+  }
+  for (uint8_t i = 0; i < n; i++) buf[i] = (uint8_t)Wire.read();
+  return true;
+}
+
+static uint8_t poCodeFromMa(float ma) {
+  if (po.chip == PO_CHIP_30100) {
+    uint8_t best = 0;
+    for (uint8_t c = 1; c < 16; c++) if (fabsf(PO_30100_MA[c] - ma) < fabsf(PO_30100_MA[best] - ma)) best = c;
+    return best;
+  }
+  long c = lroundf(ma / 0.2f);                     // MAX30102: 0.2 mA per LSB
+  if (c < 0) c = 0;
+  if (c > 255) c = 255;
+  return (uint8_t)c;
+}
+
+static float poMaFromCode(uint8_t c) {
+  return (po.chip == PO_CHIP_30100) ? PO_30100_MA[c & 0x0F] : c * 0.2f;
+}
+
+static uint8_t poMaxCode() { return po.chip == PO_CHIP_30100 ? 15 : 250; }
+
+static bool poApplyLeds() {
+  const uint8_t ir = poCodeFromMa(po.irMa), red = poCodeFromMa(po.redMa);
+  po.irMa = poMaFromCode(ir);
+  po.redMa = poMaFromCode(red);
+  s_poIrMa = po.irMa;
+  s_poRedMa = po.redMa;
+  if (po.chip == PO_CHIP_30100) return poWriteReg(0x09, (uint8_t)((red << 4) | ir));
+  return poWriteReg(0x0C, red) && poWriteReg(0x0D, ir);     // LED1 = red, LED2 = IR
+}
+
+// Restart analysis (finger placed/removed, LED current changed).
+static void poResetAnalysis(uint32_t now) {
+  po.fill = 0; po.idx = 0;
+  po.dcInit = false;
+  po.lpIr.reset(); po.lpRed.reset();
+  po.decim = 0;
+  po.settleUntil = now + PO_SETTLE_MS;
+  po.env = 0; po.v1 = 0; po.v2 = 0;
+  po.motionSinceMs = 0;
+  po.refRms = 0;                 // amplitude scale changes with LED current / finger
+  po.candHr = 0; po.candCount = 0;
+}
+
+static void poPublishInvalid(uint8_t state) {
+  s_poState = state;
+  s_poQuality = 0;
+  s_poHr = 0;
+  s_poSpo2 = 0;
+  if (state <= PO_NOFINGER) { s_poPi = 0; s_poR = 0; }
+}
+
+static bool poInit(uint32_t now) {
+  po.chip = PO_CHIP_NONE;
+  s_poChip = PO_CHIP_NONE;
+  s_poxReady = false;
+  uint8_t id = 0;
+  if (!poReadRegs(0xFF, &id, 1)) {
+    if (!po.missingLogged) {
+      po.missingLogged = true;
+      Serial.println(F("[PPG] No pulse sensor at 0x57 — check VIN/GND/SDA(21)/SCL(22). Retrying every 5 s."));
+    }
+    return false;
+  }
+  if (id == 0x11)      { po.chip = PO_CHIP_30100; po.fullScale = 65535.0f; }
+  else if (id == 0x15) { po.chip = PO_CHIP_30102; po.fullScale = 262143.0f; }
+  else {
+    Serial.printf("[PPG] Device at 0x57 has unknown part ID 0x%02X (expect 0x11 MAX30100 / 0x15 MAX30102)\n", id);
+    return false;
+  }
+
+  const uint8_t modeReg = (po.chip == PO_CHIP_30100) ? 0x06 : 0x09;
+  bool ok = poWriteReg(modeReg, 0x40);                       // soft reset
+  for (int i = 0; i < 50; i++) {                             // reset clears itself (< 1 ms typ.)
+    delay(1);
+    uint8_t m = 0x40;
+    if (poReadRegs(modeReg, &m, 1) && !(m & 0x40)) break;
+  }
+  if (po.chip == PO_CHIP_30100) {
+    ok &= poWriteReg(0x01, 0x00);                            // interrupts off (polled)
+    ok &= poWriteReg(0x07, 0x47);                            // hi-res, 100 Hz, 1600 us -> 16-bit
+    ok &= poWriteReg(0x06, 0x03);                            // SpO2 mode (IR + red)
+    ok &= poWriteReg(0x02, 0x00) && poWriteReg(0x03, 0x00) && poWriteReg(0x04, 0x00);
+  } else {
+    ok &= poWriteReg(0x02, 0x00) && poWriteReg(0x03, 0x00);  // interrupts off
+    ok &= poWriteReg(0x08, 0x1F);                            // no averaging, FIFO rollover on
+    ok &= poWriteReg(0x0A, 0x27);                            // 4096 nA, 100 Hz, 411 us -> 18-bit
+    ok &= poWriteReg(0x09, 0x03);                            // SpO2 mode (red + IR)
+    ok &= poWriteReg(0x04, 0x00) && poWriteReg(0x05, 0x00) && poWriteReg(0x06, 0x00);
+  }
+  po.irMa = po.redMa = PO_DETECT_MA;
+  ok &= poApplyLeds();
+  if (!ok) {
+    Serial.println(F("[PPG] Sensor configuration failed — retrying."));
+    po.chip = PO_CHIP_NONE;
+    return false;
+  }
+  po.lpIr.lowpass(4.0f, 100.0f, 0.7071f);                   // PPG band: < 4 Hz (240 bpm)
+  po.lpRed.lowpass(4.0f, 100.0f, 0.7071f);
+  po.finger = false;
+  po.i2cFails = 0;
+  po.agcSumIr = po.agcSumRed = po.agcMaxIr = po.agcMaxRed = 0;
+  po.agcN = 0;
+  po.lastAgcMs = po.lastAnalyseMs = now;
+  po.periodMs = 0;
+  po.lastBeatMs = 0;
+  po.missingLogged = false;
+  po.refRms = 0;
+  po.lastHr = 0;
+  poResetAnalysis(now);
+  s_poChip = po.chip;
+  s_poxReady = true;
+  poPublishInvalid(PO_NOFINGER);
+  Serial.printf("[PPG] %s detected (part ID 0x%02X) — 100 Hz, %s, automatic LED current\n",
+                po.chip == PO_CHIP_30100 ? "MAX30100" : "MAX30102", id,
+                po.chip == PO_CHIP_30100 ? "16-bit" : "18-bit");
+  return true;
+}
+
+static void poProcessSample(uint32_t irRaw, uint32_t redRaw, uint32_t now) {
+  const float ir = irRaw / po.fullScale, red = redRaw / po.fullScale;
+
+  po.agcSumIr += ir; po.agcSumRed += red;
+  if (ir > po.agcMaxIr) po.agcMaxIr = ir;
+  if (red > po.agcMaxRed) po.agcMaxRed = red;
+  po.agcN++;
+
+  if (!po.dcInit) {                                          // seed: no start-up transient
+    po.dcIr = ir; po.dcRed = red; po.dcInit = true;
+  } else {
+    po.dcIr  += (ir  - po.dcIr)  * PO_DC_ALPHA;
+    po.dcRed += (red - po.dcRed) * PO_DC_ALPHA;
+  }
+  const float acI = po.lpIr.process(ir - po.dcIr);
+  const float acR = po.lpRed.process(red - po.dcRed);
+
+  if (!po.finger || (int32_t)(now - po.settleUntil) < 0) return;
+  if (++po.decim < 2) return;                                // 100 Hz -> 50 Hz
+  po.decim = 0;
+
+  po.acIr[po.idx] = acI;     po.acRed[po.idx] = acR;
+  po.dcIrR[po.idx] = po.dcIr; po.dcRedR[po.idx] = po.dcRed;
+  po.idx = (uint16_t)((po.idx + 1) % PO_WIN);
+  if (po.fill < PO_WIN) po.fill++;
+
+  // Beat events for the heart icon. Blood absorbs light, so the systolic
+  // pulse is a DIP in the raw signal: detect peaks of the inverted signal.
+  const float v = -acI;
+  po.env = fmaxf(fabsf(v), po.env * 0.995f);
+  if (po.v1 > po.v2 && po.v1 >= v && po.v1 > 0.35f * po.env) {
+    uint32_t minGap = 250;
+    if (po.periodMs > 0) minGap = (uint32_t)fmaxf(250.0f, 0.55f * po.periodMs);
+    if (now - po.lastBeatMs >= minGap) {
+      po.lastBeatMs = now;
+      s_lastBeatMs = now;
+      s_beatCount = s_beatCount + 1;
+    }
+  }
+  po.v2 = po.v1; po.v1 = v;
+}
+
+// One LED: returns true if the current was changed.
+static bool poAdjustLed(float& ma, float mean, float mx) {
+  float target;
+  if (mx >= PO_DC_SAT) {
+    target = ma * 0.5f;                                      // saturated: halve
+  } else if (mean > PO_DC_HIGH || mean < PO_DC_LOW) {
+    float ratio = PO_DC_TARGET / fmaxf(mean, 0.01f);
+    if (ratio < 0.5f) ratio = 0.5f;
+    if (ratio > 2.0f) ratio = 2.0f;
+    target = ma * ratio;
+  } else {
+    return false;
+  }
+  if (target < PO_MIN_MA) target = PO_MIN_MA;
+  if (target > PO_MAX_MA) target = PO_MAX_MA;
+  const uint8_t oldC = poCodeFromMa(ma);
+  uint8_t newC = poCodeFromMa(target);
+  if (newC == oldC) {                                        // force at least one step
+    if (target > ma && oldC < poMaxCode()) newC = oldC + 1;
+    else if (target < ma && oldC > 1) newC = oldC - 1;
+    else return false;
+  }
+  ma = poMaFromCode(newC);
+  return true;
+}
+
+static void poAgc(uint32_t now) {
+  if (!po.agcN) return;
+  const float meanIr = po.agcSumIr / po.agcN, meanRed = po.agcSumRed / po.agcN;
+  const float maxIr = po.agcMaxIr, maxRed = po.agcMaxRed;
+  po.agcSumIr = po.agcSumRed = po.agcMaxIr = po.agcMaxRed = 0;
+  po.agcN = 0;
+  s_poIrDc = meanIr;
+  s_poRedDc = meanRed;
+
+  const bool was = po.finger;
+  if (!po.finger && (meanIr >= PO_FINGER_ON || maxIr >= PO_DC_SAT)) po.finger = true;
+  else if (po.finger && meanIr < PO_FINGER_OFF) po.finger = false;
+  if (po.finger != was) {
+    if (!po.finger) { po.irMa = po.redMa = PO_DETECT_MA; poApplyLeds(); }
+    po.periodMs = 0;
+    po.lastHr = 0;
+    poResetAnalysis(now);
+    return;
+  }
+  if (!po.finger) return;
+  const bool a = poAdjustLed(po.irMa, meanIr, maxIr);
+  const bool b = poAdjustLed(po.redMa, meanRed, maxRed);
+  if (a || b) {
+    poApplyLeds();
+    poResetAnalysis(now);
+  }
+}
+
+static void poAnalyse(uint32_t now) {
+  if (!po.finger) { poPublishInvalid(PO_NOFINGER); return; }
+  if ((int32_t)(now - po.settleUntil) < 0 || po.fill < PO_MIN_FILL) { poPublishInvalid(PO_ADJUSTING); return; }
+
+  // ---- Motion rejection: 1 s blocks, newest first; analyse only the clean
+  // signal after the most recent motion block.
+  const uint16_t full = po.fill;
+  const uint16_t nBlocks = full / PO_BLOCK;
+  float blk[PO_WIN / PO_BLOCK];
+  for (uint16_t b = 0; b < nBlocks; b++) {                     // b = 0 is the newest second
+    float e = 0, mu = 0;
+    for (uint16_t i = 0; i < PO_BLOCK; i++) mu += po.acIr[(po.idx + PO_WIN - 1 - (b * PO_BLOCK + i)) % PO_WIN];
+    mu /= PO_BLOCK;
+    for (uint16_t i = 0; i < PO_BLOCK; i++) {
+      const float d = po.acIr[(po.idx + PO_WIN - 1 - (b * PO_BLOCK + i)) % PO_WIN] - mu;
+      e += d * d;
+    }
+    blk[b] = sqrtf(e / PO_BLOCK);
+  }
+  float ref = po.refRms;
+  if (ref <= 0) {                                              // no reference yet: median block
+    float t[PO_WIN / PO_BLOCK];
+    for (uint16_t b = 0; b < nBlocks; b++) t[b] = blk[b];
+    std::sort(t, t + nBlocks);
+    ref = nBlocks ? t[nBlocks / 2] : 0;
+  }
+  uint16_t cleanBlocks = nBlocks;
+  for (uint16_t b = 0; b < nBlocks; b++) if (ref > 0 && blk[b] > PO_MOTION_X * ref) { cleanBlocks = b; break; }
+  const bool motionNow = cleanBlocks < nBlocks;
+  bool relearn = false;
+  if (motionNow) {
+    if (!po.motionSinceMs) po.motionSinceMs = now;
+    // Flagged for a long time: either real motion, or the pulse amplitude
+    // genuinely changed (finger pressure). Test the newest 5 s with a strict
+    // periodicity bar; only a clearly rhythmic signal may replace the reference.
+    if (now - po.motionSinceMs > PO_RELEARN_MS) { relearn = true; cleanBlocks = PO_MIN_FILL / PO_BLOCK; }
+  } else {
+    po.motionSinceMs = 0;
+  }
+  const uint16_t n = (uint16_t)((motionNow || relearn) ? cleanBlocks * PO_BLOCK : full);
+  if (n < PO_MIN_FILL) { poPublishInvalid(PO_WEAK); return; }  // hold still: not enough clean signal
+  const uint16_t start = (uint16_t)((po.idx + PO_WIN - n) % PO_WIN);
+  float meanI = 0, meanR = 0, dcI = 0, dcR = 0;
+  for (uint16_t i = 0; i < n; i++) {
+    const uint16_t j = (uint16_t)((start + i) % PO_WIN);
+    po_x[i] = po.acIr[j];
+    meanI += po.acIr[j]; meanR += po.acRed[j];
+    dcI += po.dcIrR[j];  dcR += po.dcRedR[j];
+  }
+  meanI /= n; meanR /= n; dcI /= n; dcR /= n;
+  float eR = 0;
+  po_cum[0] = 0;
+  for (uint16_t i = 0; i < n; i++) {
+    po_x[i] -= meanI;
+    po_cum[i + 1] = po_cum[i] + po_x[i] * po_x[i];
+    const float d = po.acRed[(start + i) % PO_WIN] - meanR;
+    eR += d * d;
+  }
+  const float rmsI = sqrtf(po_cum[n] / n), rmsR = sqrtf(eR / n);
+  const float pi = (dcI > 0) ? 2.828f * rmsI / dcI * 100.0f : 0;
+  s_poPi = pi;
+
+  // Normalised autocorrelation over 35–200 bpm
+  int kMax = PO_LAG_MAX;
+  if (kMax > n / 2) kMax = n / 2;
+  for (int k = PO_LAG_MIN - 1; k <= kMax + 1; k++) {
+    float num = 0;
+    const int m = n - k;
+    for (int i = 0; i < m; i++) num += po_x[i] * po_x[i + k];
+    const float e1 = po_cum[m], e2 = po_cum[n] - po_cum[k];
+    po_r[k] = (e1 > 0 && e2 > 0) ? num / sqrtf(e1 * e2) : 0;
+  }
+  float rMax = 0;
+  for (int k = PO_LAG_MIN; k <= kMax; k++)
+    if (po_r[k] > po_r[k - 1] && po_r[k] >= po_r[k + 1] && po_r[k] > rMax) rMax = po_r[k];
+  int kBest = -1;
+  for (int k = PO_LAG_MIN; k <= kMax && kBest < 0; k++)      // shortest strong lag = true period
+    if (po_r[k] > po_r[k - 1] && po_r[k] >= po_r[k + 1] && po_r[k] >= PO_SUBHARM * rMax && po_r[k] > 0) kBest = k;
+
+  float q = 0, hr = 0;
+  if (kBest > 0) {
+    q = po_r[kBest];
+    const float a = po_r[kBest - 1], b = po_r[kBest], c = po_r[kBest + 1];
+    const float den = a - 2.0f * b + c;
+    float lag = (float)kBest;
+    if (den < 0) lag += 0.5f * (a - c) / den;                // parabolic peak interpolation
+    hr = 60.0f * PO_AFS_HZ / lag;
+  }
+  const float R = (dcR > 0 && dcI > 0 && rmsI > 0) ? (rmsR / dcR) / (rmsI / dcI) : 0;
+  s_poR = R;
+  s_poQuality = (uint8_t)(q > 0 ? (q > 1 ? 100 : q * 100) : 0);
+
+  bool good = q >= (relearn ? PO_Q_RELEARN : PO_Q_GOOD) && pi >= PO_PI_MIN && pi <= PO_PI_MAX && hr >= 35.0f && hr <= 200.0f;
+
+  // Jump guard: a rate far from the last good one must repeat for 3 s.
+  if (good && po.lastHr > 0 && now - po.lastHrMs < 15000 && fabsf(hr - po.lastHr) > PO_JUMP_FRAC * po.lastHr) {
+    if (po.candHr > 0 && fabsf(hr - po.candHr) <= 0.10f * po.candHr) po.candCount++;
+    else { po.candHr = hr; po.candCount = 1; }
+    if (po.candCount < PO_JUMP_CONFIRM) good = false;
+  }
+  if (good) {
+    po.lastHr = hr; po.lastHrMs = now;
+    po.candHr = 0; po.candCount = 0;
+    if (relearn) { po.refRms = rmsI; po.motionSinceMs = 0; }
+    float spo2 = SPO2_CAL_A - SPO2_CAL_B * R;
+    if (spo2 > 100.0f) spo2 = 100.0f;
+    if (spo2 < 0.0f) spo2 = 0.0f;
+    s_poHr = hr;
+    s_poSpo2 = (R > 0) ? spo2 : 0;
+    s_poState = PO_GOOD;
+    po.periodMs = 60000.0f / hr;
+    po.refRms = (po.refRms <= 0) ? rmsI : 0.8f * po.refRms + 0.2f * rmsI;   // learn good-signal level
+  } else {
+    s_poHr = 0;
+    s_poSpo2 = 0;
+    s_poState = PO_WEAK;
+  }
+}
+
+static void poLost(uint32_t now, const char* why) {
+  Serial.printf("[PPG] Sensor lost (%s) — will re-initialise.\n", why);
+  po.chip = PO_CHIP_NONE;
+  s_poChip = PO_CHIP_NONE;
+  s_poxReady = false;
+  po.lastRetryMs = now;
+  poPublishInvalid(PO_MISSING);
+}
+
+// Called from the sensor task every 12 ms.
+static void poService(uint32_t now) {
+  if (po.chip == PO_CHIP_NONE) {
+    poPublishInvalid(PO_MISSING);
+    if (now - po.lastRetryMs >= PO_RETRY_MS) { po.lastRetryMs = now; poInit(now); }
+    return;
+  }
+  const bool     is100  = po.chip == PO_CHIP_30100;
+  const uint8_t  depth  = is100 ? 16 : 32;
+  const uint8_t  bytesS = is100 ? 4 : 6;
+  const uint8_t  ptrReg = is100 ? 0x02 : 0x04;               // WR_PTR, OVF, RD_PTR (consecutive)
+  const uint8_t  datReg = is100 ? 0x05 : 0x07;
+  uint8_t p[3];
+  if (!poReadRegs(ptrReg, p, 3)) {
+    if (++po.i2cFails >= PO_I2C_FAIL_MAX) poLost(now, "I2C not responding");
+    return;
+  }
+  po.i2cFails = 0;
+  uint8_t n = (uint8_t)((p[0] - p[2]) & (depth - 1));
+  if (n == 0 && p[1] != 0) n = depth;                        // FIFO full / overflowed
+  const uint8_t maxChunk = (uint8_t)(120 / bytesS);          // stay inside the 128-byte Wire buffer
+  uint8_t buf[120];
+  while (n > 0) {
+    const uint8_t c = n < maxChunk ? n : maxChunk;
+    if (!poReadRegs(datReg, buf, (uint8_t)(c * bytesS))) {
+      if (++po.i2cFails >= PO_I2C_FAIL_MAX) poLost(now, "FIFO read failed");
+      return;
+    }
+    for (uint8_t s = 0; s < c; s++) {
+      const uint8_t* b = buf + s * bytesS;
+      uint32_t ir, red;
+      if (is100) {                                           // MAX30100: IR then red, 16-bit
+        ir  = ((uint32_t)b[0] << 8) | b[1];
+        red = ((uint32_t)b[2] << 8) | b[3];
+      } else {                                               // MAX30102: red then IR, 18-bit
+        red = (((uint32_t)b[0] << 16) | ((uint32_t)b[1] << 8) | b[2]) & 0x3FFFF;
+        ir  = (((uint32_t)b[3] << 16) | ((uint32_t)b[4] << 8) | b[5]) & 0x3FFFF;
+      }
+      poProcessSample(ir, red, now);
+    }
+    n -= c;
+  }
+  if (now - po.lastAgcMs >= PO_AGC_MS) { po.lastAgcMs = now; poAgc(now); }
+  if (now - po.lastAnalyseMs >= PO_ANALYSE_MS) { po.lastAnalyseMs = now; poAnalyse(now); }
+}
+// ==== PULSE OXIMETER MODULE END ====
+
+// =====================================================================
+//  WATCHDOG + RESET CAUSE
+// =====================================================================
+static void watchdogInit() {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  esp_task_wdt_config_t cfg;
+  cfg.timeout_ms     = WDT_TIMEOUT_S * 1000;
+  cfg.idle_core_mask = 1;             // keep watching core-0 idle (WiFi core)
+  cfg.trigger_panic  = true;          // hung task -> reboot
+  if (esp_task_wdt_reconfigure(&cfg) == ESP_ERR_INVALID_STATE) esp_task_wdt_init(&cfg);
+#else
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);   // IDF 4.x: (re)configures timeout + panic
+#endif
+}
+
+static const char* resetReasonText(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:  return "power-on";
+    case ESP_RST_EXT:      return "external pin";
+    case ESP_RST_SW:       return "software restart";
+    case ESP_RST_PANIC:    return "PANIC / exception";
+    case ESP_RST_INT_WDT:  return "INTERRUPT WATCHDOG";
+    case ESP_RST_TASK_WDT: return "TASK WATCHDOG (a task hung)";
+    case ESP_RST_WDT:      return "OTHER WATCHDOG";
+    case ESP_RST_DEEPSLEEP:return "deep-sleep wake";
+    case ESP_RST_BROWNOUT: return "BROWN-OUT (supply dipped — check power)";
+    default:               return "unknown";
+  }
+}
+
+// =====================================================================
+//  SENSOR TASK — core 1, 250 Hz. Owns ADC, LO pins and the I2C bus.
+// =====================================================================
+static void sensorTask(void* arg) {
+  (void)arg;
+  esp_task_wdt_add(NULL);
+
+  s_hpf.design(ECG_HP_HZ, ECG_FS);
+  s_notch.notch(MAINS_HZ, ECG_FS, ECG_NOTCH_Q);
+  s_lpf.lowpass(ECG_LP_HZ, ECG_FS, 0.7071f);
+  s_qrs.design();
+  s_qrs.reset(millis());
+
+  // 1 s signal-quality window
+  uint16_t winMin = 4095, winMax = 0;
+  uint32_t winN = 0, winPinned = 0, winSum = 0, winStart = millis();
+  bool     saturated = false, clipping = false, flat = false, wasSaturated = false;
+
+  // LO pins: debounced as a bitmask (bit0 = LO+, bit1 = LO-)
+  uint8_t  loStable = LEAD_LO_PLUS | LEAD_LO_MINUS, loPending = loStable;
+  uint32_t loPendingMs = millis();
+
+  bool     leadOff = true;
+  bool     overrideLogged = false;
+  uint8_t  poxDiv = 0;
+
+  // Seed the 0.5 Hz high-pass with the real DC level. Starting from 0 caused
+  // a multi-second transient that made the QRS detector learn a threshold
+  // ~10x too high, so beats were missed after every boot.
+  {
+    uint32_t a = 0;
+    for (int i = 0; i < ECG_OVERSAMPLE; i++) a += analogRead(ECG_OUTPUT_PIN);
+    s_hpf.reset((a / ECG_OVERSAMPLE) * UV_PER_COUNT);
+  }
+
+  TickType_t wake = xTaskGetTickCount();
+  for (;;) {
+    vTaskDelayUntil(&wake, SENSOR_PERIOD);
+    esp_task_wdt_reset();
+    const uint32_t now = millis();
+
+    // ---------------- ECG acquisition ----------------
+    uint32_t acc = 0;
+    for (int i = 0; i < ECG_OVERSAMPLE; i++) acc += analogRead(ECG_OUTPUT_PIN);
+    const uint16_t raw    = (uint16_t)(acc / ECG_OVERSAMPLE);
+    const bool     pinned = raw <= ADC_PINNED_LOW || raw >= ADC_PINNED_HIGH;
+
+    uint8_t loRaw = 0;
+    if (digitalRead(LO_PLUS_PIN)  == HIGH) loRaw |= LEAD_LO_PLUS;
+    if (digitalRead(LO_MINUS_PIN) == HIGH) loRaw |= LEAD_LO_MINUS;
+    if (loRaw != loStable) {                       // debounce LO pins (300 ms)
+      if (loRaw != loPending) { loPending = loRaw; loPendingMs = now; }
+      if (now - loPendingMs >= LO_DEBOUNCE_MS) loStable = loRaw;
+    } else {
+      loPending = loRaw;
+    }
+
+    // ---------------- 1 s signal-quality window ----------------
+    if (raw < winMin) winMin = raw;
+    if (raw > winMax) winMax = raw;
+    winN++; winSum += raw;
+    if (pinned) winPinned++;
+    if (now - winStart >= SIG_WINDOW_MS) {
+      const uint8_t pct = (uint8_t)(winN ? winPinned * 100 / winN : 0);
+      saturated = pct >= SATURATED_PCT;            // output stuck at a rail
+      clipping  = pct >= CLIPPING_PCT;
+      flat      = (winMax - winMin) < FLAT_RANGE_COUNTS;
+      s_dbgRawMin = winMin; s_dbgRawMax = winMax;
+      s_dbgRawAvg = (uint16_t)(winN ? winSum / winN : 0);
+      s_dbgPinnedPct = pct;
+      winMin = 4095; winMax = 0; winN = 0; winPinned = 0; winSum = 0;
+      winStart = now;
+    }
+
+    const float uv = raw * UV_PER_COUNT;           // µV at the electrodes (+DC)
+
+    // After full saturation the filters/detector hold garbage: restart them
+    // the moment the amplifier output comes back into range.
+    if (wasSaturated && !saturated) {
+      s_hpf.reset(uv); s_notch.reset(); s_lpf.reset();
+      s_qrs.reset(now);
+    }
+    wasSaturated = saturated;
+
+    const float y = s_lpf.process(s_notch.process(s_hpf.process(uv)));
+
+    // The QRS detector runs on every in-range sample, even while the LO pins
+    // say "off", so a readable ECG can override a flaky LO pin.
+    bool beat = false;
+    if (!pinned && !saturated) beat = s_qrs.process(y, now);
+    const bool rhythm = s_qrs.rhythmPresent(now, LO_OVERRIDE_MS);
+
+    // ---------------- Lead-off decision ----------------
+    // Override hysteresis: a confirmed connection is KEPT while a regular
+    // rhythm continues; switching ON against the LO pins needs a strong rhythm.
+    const bool loOff     = loStable != 0;
+    const bool loIgnored = LO_SIGNAL_OVERRIDE && loOff && !saturated &&
+                           (leadOff ? s_qrs.rhythmStrong(now, LO_OVERRIDE_MS) : rhythm);
+    const bool off = saturated ||
+                     (loOff && !loIgnored) ||
+                     (!LO_PINS_TRUSTED && flat);
+
+    uint8_t reason = loStable;
+    if (saturated) reason |= LEAD_SATURATED;
+    if (clipping)  reason |= LEAD_CLIPPING;
+    if (loIgnored) reason |= LEAD_LO_IGNORED;
+    s_leadReason = reason;
+
+    if (loIgnored && !overrideLogged) {
+      overrideLogged = true;
+      Serial.printf("[ECG] LO pin(s) report OFF (0x%02X) but a regular ECG is present — "
+                    "ignoring LO. Check electrode gel/contact and LO wiring.\n", loStable);
+    }
+    if (!loOff) overrideLogged = false;
+
+    // Filters and detector run continuously, so nothing is reset here (in
+    // v3 every lead flicker reset them and the heart rate dropped out).
+    if (off != leadOff) {
+      leadOff = off;
+      if (!leadOff) {                              // leads on: start asystole timer
+        s_lastQrsMs = now;
+        s_leadOnSinceMs = now;
+      }
+      s_leadOff = leadOff;
+    }
+
+    int16_t out = 0;                               // leads off -> flat line
+    if (!leadOff) {
+      if (beat) { s_qrsCount = s_qrsCount + 1; s_lastQrsMs = now; }
+      s_ecgHr = s_qrs.hr(now);
+      out = (int16_t)constrain(lroundf(y), -32767L, 32767L);
+    } else {
+      s_ecgHr = 0;
+    }
+    if (xQueueSend(ecgQueue, &out, 0) != pdTRUE) s_ecgDrops = s_ecgDrops + 1;
+
+#if ECG_SERIAL_PLOT
+    Serial.printf("raw:%u,ecg_uV:%d,lo:%u\n", raw, (int)out, loStable);
+#endif
+
+    // ---------------- Pulse oximeter (own driver + DSP) ----------------
+    if (++poxDiv >= POX_UPDATE_DIV) {
+      poxDiv = 0;
+      poService(now);
+    }
+  }
+}
+
+// =====================================================================
+//  VITALS + ALARM ENGINE (loop context)
+// =====================================================================
+// ==== PULSE DISPLAY BEGIN ====
+// Stable pulse rate + SpO2 for the dashboard (called once per second).
+float    g_pulseFilt = 0, g_spo2Filt = 0;
+uint32_t g_pulseHoldUntil = 0;
+uint8_t  g_spo2Hist[SPO2_MEDIAN_N];
+uint8_t  g_spo2HistN = 0, g_spo2HistIdx = 0;
+
+static void spo2Reset() { g_spo2 = 0; g_spo2Filt = 0; g_spo2HistN = g_spo2HistIdx = 0; }
+
+static void updatePulseDisplay() {
+  const uint8_t  st = s_poState;
+  const float    hr = s_poHr;
+  const float    sp = s_poSpo2;
+  const uint32_t t  = millis();
+  const bool valid    = st == PO_GOOD && hr >= 30.0f && hr <= 200.0f;
+  const bool holdable = st == PO_WEAK || st == PO_ADJUSTING;   // finger still on
+
+  if (valid) {
+    // Confirmed big change (module already required 3 s of agreement): snap to it.
+    if (g_pulseFilt <= 0 || fabsf(hr - g_pulseFilt) > 12.0f) g_pulseFilt = hr;
+    else g_pulseFilt += PULSE_EMA_ALPHA * (hr - g_pulseFilt);
+    g_pulseHoldUntil = t + PULSE_HOLD_MS;
+    if (g_pulse == 0 || fabsf(g_pulseFilt - g_pulse) >= PULSE_HYST_BPM) g_pulse = (int)lroundf(g_pulseFilt);
+  } else if (holdable && g_pulse > 0 && (int32_t)(g_pulseHoldUntil - t) > 0) {
+    // brief motion / LED re-tune: keep the last stable value
+  } else {
+    g_pulse = 0;
+    g_pulseFilt = 0;
+  }
+
+  if (valid && g_pulse > 0 && sp >= SPO2_MIN_VALID && sp <= 100.0f) {
+    g_spo2Hist[g_spo2HistIdx] = (uint8_t)lroundf(sp);
+    g_spo2HistIdx = (uint8_t)((g_spo2HistIdx + 1) % SPO2_MEDIAN_N);
+    if (g_spo2HistN < SPO2_MEDIAN_N) g_spo2HistN++;
+    uint8_t v[SPO2_MEDIAN_N];
+    for (uint8_t i = 0; i < g_spo2HistN; i++) v[i] = g_spo2Hist[i];
+    for (uint8_t i = 1; i < g_spo2HistN; i++) {
+      const uint8_t x = v[i]; int j = i - 1;
+      while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; j--; }
+      v[j + 1] = x;
+    }
+    const float m = v[g_spo2HistN / 2];
+    g_spo2Filt = (g_spo2Filt <= 0) ? m : g_spo2Filt + SPO2_EMA_ALPHA * (m - g_spo2Filt);
+    if (g_spo2 == 0 || fabsf(g_spo2Filt - g_spo2) >= SPO2_HYST_PCT) g_spo2 = (int)lroundf(g_spo2Filt);
+  } else if (g_pulse == 0) {
+    spo2Reset();                                 // value disappears with the pulse
+  }
+}
+// ==== PULSE DISPLAY END ====
+
+static void computeVitals() {
+  const bool  leadOff = s_leadOff;
+  const float ecgHrF  = s_ecgHr;
+  g_ecgHr = (!leadOff && ecgHrF > 0) ? (int)lroundf(ecgHrF) : 0;
+
+  // g_pulse / g_spo2 are produced by updatePulseDisplay() at 1 Hz.
+#if HR_FROM_PULSE_OX
+  g_hr = (g_pulse > 0) ? g_pulse : (HR_FALLBACK_TO_ECG ? g_ecgHr : 0);
+#else
+  g_hr = (g_ecgHr > 0) ? g_ecgHr : g_pulse;
+#endif
+
+  if (!g_standby) {                                // arm technical alarms only after
+    if (g_ecgHr > 0)        g_ecgArmed  = true;    // a sensor has produced valid data
+    if (g_pulse > 0)        g_spo2Armed = true;
+    if (g_temperature > 0)  g_tempArmed = true;
+  }
+}
+
+static void alarmUpdate(uint8_t id, bool cond, uint32_t now) {
+  AlarmState& a = g_al[id];
+  if (cond) {
+    a.clearing = false;
+    if (!a.cond) { a.cond = true; a.condSince = now; }
+    if (!a.active && now - a.condSince >= ALARM_DEFS[id].delayMs) {
+      a.active = true;
+      a.silencedUntil = 0;
+      Serial.printf("[ALARM] ON   %s (priority %u)\n", ALARM_DEFS[id].name, ALARM_DEFS[id].prio);
+    }
+  } else {
+    a.cond = false;
+    if (a.active) {
+      if (!a.clearing) { a.clearing = true; a.clearSince = now; }
+      if (now - a.clearSince >= ALARM_CLEAR_MS) {
+        a.active = false; a.clearing = false;
+        Serial.printf("[ALARM] OFF  %s\n", ALARM_DEFS[id].name);
+      }
+    }
+  }
+}
+
+static bool alarmSilenced(uint8_t id, uint32_t now) {
+  return g_al[id].silencedUntil != 0 && (int32_t)(g_al[id].silencedUntil - now) > 0;
+}
+
+static void alarmAck(int id, uint32_t now) {
+  if (id < 0 || id >= AL_COUNT || !g_al[id].active) return;
+  g_al[id].silencedUntil = now + ALARM_SILENCE_MS;
+  if (g_al[id].silencedUntil == 0) g_al[id].silencedUntil = 1;
+  g_forceAlarmSend = true;
+  Serial.printf("[ALARM] ACK  %s (silenced %lu s)\n", ALARM_DEFS[id].name, (unsigned long)(ALARM_SILENCE_MS / 1000));
+}
+
+static void setStandby(bool on) {
+  if (g_standby == on) return;
+  g_standby = on;
+  memset(g_al, 0, sizeof g_al);
+  g_ecgArmed = g_spo2Armed = g_tempArmed = false;
+  g_forceAlarmSend = true;
+  Serial.println(on ? F("[ALARM] STANDBY — all alarms paused")
+                    : F("[ALARM] Monitoring resumed"));
+}
+
+// Returns the highest priority among active, un-silenced alarms (0 = none).
+static uint8_t evaluateAlarms() {
+  if (g_standby) return 0;
+  const uint32_t lastQrs     = s_lastQrsMs;
+  const uint32_t leadOnSince = s_leadOnSinceMs;
+  const bool     leadOff     = s_leadOff;
+  const bool     poxReady    = s_poxReady;
+  const uint32_t now         = millis();           // read after the snapshot
+
+  alarmUpdate(AL_ASYSTOLE, g_ecgArmed && !leadOff &&
+              (now - leadOnSince) >= ASYSTOLE_LEADS_ON_MS &&
+              (now - lastQrs) >= ASYSTOLE_NO_QRS_MS, now);
+  alarmUpdate(AL_HR_LOW,     g_hr > 0 && g_hr < HR_CRIT_LOW, now);
+  alarmUpdate(AL_HR_HIGH,    g_hr > HR_CRIT_HIGH, now);
+  alarmUpdate(AL_SPO2_LOW,   g_spo2 > 0 && g_spo2 < SPO2_CRIT_LOW, now);
+  alarmUpdate(AL_TEMP_HIGH,  g_temperature > TEMP_ALARM_HIGH, now);
+  alarmUpdate(AL_TEMP_LOW,   g_temperature > 0 && g_temperature < TEMP_ALARM_LOW, now);
+  alarmUpdate(AL_LEADS_OFF,  g_ecgArmed && leadOff, now);
+  alarmUpdate(AL_SPO2_NOSIG, g_spo2Armed && poxReady && g_pulse == 0, now);
+  alarmUpdate(AL_SPO2_LOST,  g_spo2Armed && !poxReady, now);
+  alarmUpdate(AL_TEMP_LOST,  g_tempArmed && g_temperature == 0, now);
+
+  uint8_t top = 0;
+  for (uint8_t i = 0; i < AL_COUNT; i++) {
+    if (g_al[i].active && !alarmSilenced(i, now) && ALARM_DEFS[i].prio > top) top = ALARM_DEFS[i].prio;
+  }
+  return top;
+}
+
+// "A:<standby>|id,prio,silenced;id,prio,silenced..."
+static void buildAlarmMsg(uint32_t now) {
+  g_aMsg = "A:";
+  g_aMsg += g_standby ? '1' : '0';
+  g_aMsg += '|';
+  bool first = true;
+  for (uint8_t i = 0; i < AL_COUNT; i++) {
+    if (!g_al[i].active) continue;
+    if (!first) g_aMsg += ';';
+    first = false;
+    g_aMsg += (int)i;                     g_aMsg += ',';
+    g_aMsg += (int)ALARM_DEFS[i].prio;    g_aMsg += ',';
+    g_aMsg += alarmSilenced(i, now) ? '1' : '0';
+  }
+}
+
+static void updateAlarmLed(uint8_t topPrio, uint32_t now) {
+  if (ALARM_LED_PIN < 0) return;
+  bool on;
+  if      (topPrio >= PRIO_CRIT) on = (now / 125) & 1;   // 4 Hz flash
+  else if (topPrio == PRIO_HIGH) on = (now / 500) & 1;   // 1 Hz flash
+  else if (topPrio == PRIO_LOW)  on = true;              // steady
+  else                           on = false;
+  digitalWrite(ALARM_LED_PIN, on ? HIGH : LOW);
+}
+
+// =====================================================================
+//  SETUP
+// =====================================================================
+void setup() {
+  Serial.setTxBufferSize(1024);           // logging never blocks the sensor task
+  Serial.begin(115200);
+  delay(300);
+  Serial.println();
+  Serial.println(F("=============================================="));
+  Serial.println(F(" MedMonitor v3.4 — ESP32 patient vitals monitor"));
+  Serial.println(F(" PROTOTYPE — not a certified medical device"));
+  Serial.println(F(" Battery power only while electrodes are on a person"));
+  Serial.println(F("=============================================="));
+  Serial.printf("[BOOT] Reset reason: %s\n", resetReasonText(esp_reset_reason()));
+  if (strcmp(DASH_PASS, DASH_PASS_DEFAULT) == 0) {
+    Serial.println(F("[SEC]  WARNING: default dashboard password — change DASH_PASS!"));
+  }
+
+  pinMode(LO_PLUS_PIN, INPUT_PULLUP);
+  pinMode(LO_MINUS_PIN, INPUT_PULLUP);
+  analogReadResolution(12);
+  analogSetPinAttenuation(ECG_OUTPUT_PIN, ADC_11db);
+  if (ALARM_LED_PIN >= 0) { pinMode(ALARM_LED_PIN, OUTPUT); digitalWrite(ALARM_LED_PIN, LOW); }
+
+  dht.begin();
+  ds18b20.begin();
+  ds18b20.setWaitForConversion(false);
+
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(I2C_CLOCK_HZ);
+  Wire.setTimeOut(I2C_TIMEOUT_MS);
+  i2cScanReport();
+  poInit(millis());                       // last I2C use outside the sensor task
+
+  prefs.begin("patient", false);
+  prefsLog.begin("log", false);
+  g_log.fsOk = LittleFS.begin(true);      // formats the partition on first use
+  if (g_log.fsOk) {
+    Serial.printf("[LOG] Flash filesystem: %lu KB free of %lu KB\n",
+                  (unsigned long)((LittleFS.totalBytes() - LittleFS.usedBytes()) / 1024),
+                  (unsigned long)(LittleFS.totalBytes() / 1024));
+    logRestoreAtBoot();
+  } else {
+    Serial.println(F("[LOG] No flash filesystem! Tools > Partition Scheme: pick one with SPIFFS (e.g. Default 4MB with spiffs)"));
+  }
+
+  g_ecgMsg.reserve(96);
+  g_vMsg.reserve(112);
+  g_aMsg.reserve(96);
+
+  ecgQueue = xQueueCreate(ECG_QUEUE_LEN, sizeof(int16_t));
+  if (ecgQueue == nullptr) {
+    Serial.println(F("[FATAL] ECG queue allocation failed — restarting."));
+    delay(1000);
+    ESP.restart();
+  }
+
+  watchdogInit();
+  // Core 1 (same as loop) at higher priority -> preempts loop() every 4 ms.
+  xTaskCreatePinnedToCore(sensorTask, "sensors", 6144, nullptr, 3, &g_sensorTask, 1);
+
+  startWiFi();
+  snprintf(g_wsToken, sizeof g_wsToken, "%08lx%08lx",
+           (unsigned long)esp_random(), (unsigned long)esp_random());   // per-boot WS token
+
+  server.on("/", handleRoot);
+  server.on("/api/token", HTTP_GET, handleToken);
+  server.on("/api/patient", HTTP_GET, handlePatientGet);
+  server.on("/api/patient", HTTP_POST, handlePatientPost);
+  server.on("/api/log/start",  HTTP_POST, handleLogStart);
+  server.on("/api/log/stop",   HTTP_POST, handleLogStop);
+  server.on("/api/log/status", HTTP_GET,  handleLogStatus);
+  server.on("/api/log.csv",    HTTP_GET,  handleLogDownload);
+  server.onNotFound(handleNotFound);
+  server.begin();
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+  webSocket.enableHeartbeat(15000, 3000, 2);
+
+  esp_task_wdt_add(NULL);                 // watch loop() too (setup runs in loopTask)
+}
+
+// =====================================================================
+//  LOOP — networking, slow sensors, alarms
+// =====================================================================
+unsigned long lastVitals = 0, lastDht = 0, lastTemp = 0, lastAlarmEval = 0;
+unsigned long lastAlarmSend = 0, lastStats = 0, lastNoViewerWarn = 0, lastPulseUpd = 0;
+uint32_t sentBeatCount = 0, sentQrsCount = 0;
+bool     sentLeadOff = true;
+uint8_t  sentLeadReason = 0xFF;
+uint8_t  g_topPrio = 0;
+
+void loop() {
+  esp_task_wdt_reset();
+  server.handleClient();
+  webSocket.loop();
+  serviceWiFi();
+
+  const unsigned long now = millis();
+  wsHousekeeping(now);
+
+  // ---------- ECG: forward in batches ----------
+  const uint32_t waiting = uxQueueMessagesWaiting(ecgQueue);
+  if (waiting > g_queueMax) g_queueMax = waiting;
+  const bool viewers = wsAuthedCount() > 0;
+  while (uxQueueMessagesWaiting(ecgQueue) >= ECG_BATCH) {
+    g_ecgMsg = "E:";
+    for (int i = 0; i < ECG_BATCH; i++) {
+      int16_t s;
+      if (xQueueReceive(ecgQueue, &s, 0) != pdTRUE) break;
+      if (i) g_ecgMsg += ',';
+      g_ecgMsg += (int)s;
+    }
+    if (viewers) wsSendAll(g_ecgMsg);
+  }
+
+  // ---------- Lead state ----------
+  const bool    leadOff    = s_leadOff;
+  const uint8_t leadReason = s_leadReason;
+  if (leadOff != sentLeadOff || leadReason != sentLeadReason) {
+    if (leadOff != sentLeadOff) {
+      Serial.printf("[ECG] %s (reason 0x%02X: %s%s%s)\n",
+                    leadOff ? "Electrodes OFF / lead fault" : "Electrodes connected", leadReason,
+                    (leadReason & LEAD_LO_PLUS)   ? "LO+ high " : "",
+                    (leadReason & LEAD_LO_MINUS)  ? "LO- high " : "",
+                    (leadReason & LEAD_SATURATED) ? "output saturated" : "");
+    }
+    sentLeadOff = leadOff;
+    sentLeadReason = leadReason;
+    buildLeadMsg(leadOff, leadReason);
+    wsSendAll(g_lMsg);
+  }
+
+  // ---------- Heart blink: follows the source of the Heart Rate card ----------
+  const uint32_t q = s_qrsCount, b = s_beatCount;
+#if HR_FROM_PULSE_OX
+  const bool ecgBlink = g_pulse == 0 && HR_FALLBACK_TO_ECG && g_ecgHr > 0;
+#else
+  const bool ecgBlink = g_ecgHr > 0;
+#endif
+  if (q != sentQrsCount)  { sentQrsCount  = q; if (ecgBlink)  { g_bMsg = "B:"; wsSendAll(g_bMsg); } }
+  if (b != sentBeatCount) { sentBeatCount = b; if (!ecgBlink) { g_bMsg = "B:"; wsSendAll(g_bMsg); } }
+
+  // ---------- Stable pulse rate / SpO2 (1 Hz, before alarms use them) ----------
+  if (now - lastPulseUpd >= 1000) {
+    lastPulseUpd = now;
+    updatePulseDisplay();
+  }
+
+  // ---------- DHT11 (max 1 read / 2 s) ----------
+  if (now - lastDht >= DHT_INTERVAL) {
+    lastDht = now;
+    const float h = dht.readHumidity();
+    const float t = dht.readTemperature();
+    if (!isnan(h) && !isnan(t)) { g_humidity = h; g_roomTemp = t; g_dhtLastOkMs = now; }
+  }
+  if (g_dhtLastOkMs && now - g_dhtLastOkMs > SENSOR_STALE_MS) { g_humidity = 0; g_roomTemp = 0; }
+
+  // ---------- DS18B20 (async) ----------
+  if (now - lastTemp >= TEMP_INTERVAL) {
+    lastTemp = now;
+    ds18b20.requestTemperatures();
+    const float t = ds18b20.getTempCByIndex(0);
+    if (t != DEVICE_DISCONNECTED_C && t > 0 && t < 80) {   // 85.0 = power-on value, rejected
+      g_temperature = t + BODY_TEMP_OFFSET_C;
+      g_tempLastOkMs = now;
+    }
+  }
+  if (g_tempLastOkMs && now - g_tempLastOkMs > SENSOR_STALE_MS) g_temperature = 0;
+
+  // ---------- Alarms (4 Hz) ----------
+  if (now - lastAlarmEval >= ALARM_EVAL_MS) {
+    lastAlarmEval = now;
+    computeVitals();
+    g_topPrio = evaluateAlarms();
+    buildAlarmMsg(millis());
+    if (g_forceAlarmSend || g_aMsg != g_lastAMsg || now - lastAlarmSend >= ALARM_RESEND_MS) {
+      g_forceAlarmSend = false;
+      g_lastAMsg = g_aMsg;
+      lastAlarmSend = now;
+      wsSendAll(g_aMsg);
+    }
+    if (g_topPrio >= PRIO_HIGH && wsAuthedCount() == 0 && now - lastNoViewerWarn >= 10000) {
+      lastNoViewerWarn = now;
+      Serial.println(F("[ALARM] !!! Alarm active and NO dashboard connected !!!"));
+    }
+  }
+  updateAlarmLed(g_topPrio, now);
+
+  // ---------- 1 Hz vitals ----------
+  if (now - lastVitals >= VITALS_INTERVAL) {
+    lastVitals = now;
+    g_vMsg = "V:";
+    g_vMsg += g_hr;                     g_vMsg += ',';
+    g_vMsg += g_spo2;                   g_vMsg += ',';
+    g_vMsg += String(g_temperature, 1); g_vMsg += ',';
+    g_vMsg += String(g_roomTemp, 1);    g_vMsg += ',';
+    g_vMsg += String(g_humidity, 1);    g_vMsg += ',';
+    g_vMsg += leadOff ? '1' : '0';      g_vMsg += ',';
+    g_vMsg += g_ecgHr;                  g_vMsg += ',';
+    g_vMsg += g_pulse;                  g_vMsg += ',';
+    g_vMsg += (int)leadReason;          g_vMsg += ',';
+    g_vMsg += (int)s_poState;           g_vMsg += ',';
+    g_vMsg += (int)s_poQuality;         g_vMsg += ',';
+    g_vMsg += (int)lroundf(s_poPi * 10.0f);   // PI x 10
+    wsSendAll(g_vMsg);
+    Serial.printf("[VITALS] HR=%d (pulse %d, ECG %d)  SpO2=%d%%  Skin=%.1fC  Room=%.1fC  RH=%.0f%%\n",
+                  g_hr, g_pulse, g_ecgHr, g_spo2, g_temperature, g_roomTemp, g_humidity);
+    {
+      static const char* const ST[] = {"SENSOR MISSING", "NO FINGER", "ADJUSTING", "WEAK/MOTION", "GOOD"};
+      const uint8_t st = s_poState;
+      Serial.printf("[PPG] %s %-14s IR %4.1fmA DC %3.0f%% | RED %4.1fmA DC %3.0f%% | PI %.2f%% q=%.2f HR=%.1f R=%.3f SpO2=%.1f\n",
+                    s_poChip == PO_CHIP_30100 ? "MAX30100" : s_poChip == PO_CHIP_30102 ? "MAX30102" : "--------",
+                    ST[st < 5 ? st : 0], (float)s_poIrMa, (float)s_poIrDc * 100.0f,
+                    (float)s_poRedMa, (float)s_poRedDc * 100.0f, (float)s_poPi,
+                    s_poQuality / 100.0f, (float)s_poHr, (float)s_poR, (float)s_poSpo2);
+    }
+    // ECG diagnostics: healthy = LO+=0 LO-=0, avg ~1500-2500, span > 200, pinned 0 %
+    Serial.printf("[ECGDIAG] leads=%s LO+=%d LO-=%d raw min/avg/max=%u/%u/%u span=%u pinned=%u%% qrs=%lu%s%s\n",
+                  leadOff ? "OFF" : "on",
+                  (leadReason & LEAD_LO_PLUS) ? 1 : 0, (leadReason & LEAD_LO_MINUS) ? 1 : 0,
+                  (unsigned)s_dbgRawMin, (unsigned)s_dbgRawAvg, (unsigned)s_dbgRawMax,
+                  (unsigned)(s_dbgRawMax - s_dbgRawMin), (unsigned)s_dbgPinnedPct,
+                  (unsigned long)s_qrsCount,
+                  (leadReason & LEAD_LO_IGNORED) ? "  [LO ignored: ECG present]" : "",
+                  (leadReason & LEAD_CLIPPING)   ? "  [CLIPPING]" : "");
+  }
+
+  // ---------- Data logging ----------
+  logService(now);
+
+  // ---------- 60 s health statistics ----------
+  if (now - lastStats >= STATS_INTERVAL_MS) {
+    lastStats = now;
+    Serial.printf("[STATS] heap=%u B  sensorStackFree=%u B  ecgQueueMax=%lu/%d  ecgDrops=%lu  slowClients=%lu  viewers=%u\n",
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)uxTaskGetStackHighWaterMark(g_sensorTask),
+                  (unsigned long)g_queueMax, ECG_QUEUE_LEN,
+                  (unsigned long)s_ecgDrops, (unsigned long)g_slowClientDrops,
+                  (unsigned)wsAuthedCount());
+    g_queueMax = 0;
+  }
+
+  vTaskDelay(1);   // let IDLE run on core 1
+}
